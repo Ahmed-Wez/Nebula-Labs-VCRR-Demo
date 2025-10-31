@@ -25,43 +25,51 @@ def compute_accuracy(model, loader, device):
     return 100.0 * correct / total if total > 0 else 0.0
 
 def fisher_information(model, loader, device):
-    # approximate fisher diagonal for parameters using labels from loader
+    """
+    Approximate Fisher diagonal for parameters using loader (one pass).
+    Returns a dict mapping parameter name -> tensor (same shape as param).
+    """
     model.eval()
     fisher = {}
     for n, p in model.named_parameters():
         fisher[n] = torch.zeros_like(p.data)
+
+    loss_fn = nn.CrossEntropyLoss()
+    count = 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         model.zero_grad()
         out = model(x)
-        loss = nn.CrossEntropyLoss()(out, y)
+        loss = loss_fn(out, y)
         loss.backward()
         for n, p in model.named_parameters():
             if p.grad is not None:
                 fisher[n] += (p.grad.data.clone() ** 2)
-    # average
-    for n in fisher:
-        fisher[n] = fisher[n] / len(loader)
+        count += 1
+
+    if count > 0:
+        for n in fisher:
+            fisher[n] = fisher[n] / float(count)
     return fisher
 
-def train_task(model, train_loader, optimizer, device, epochs=3):
-    model.train()
+def train_task_loop(model, train_loader, device, optimizer, epochs=3, ewc_fisher=None, ewc_params=None, lambda_ewc=1000.0, method="ewc"):
     loss_fn = nn.CrossEntropyLoss()
     for epoch in range(epochs):
+        model.train()
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             out = model(x)
             loss = loss_fn(out, y)
+            # EWC penalty if available
+            if method == "ewc" and ewc_fisher is not None and ewc_params is not None:
+                penalty = 0.0
+                for n, p in model.named_parameters():
+                    if n in ewc_fisher:
+                        penalty = penalty + (ewc_fisher[n].to(p.device) * (p - ewc_params[n].to(p.device))**2).sum()
+                loss = loss + 0.5 * lambda_ewc * penalty
             loss.backward()
             optimizer.step()
-
-def apply_ewc_penalty(model, fisher, opt_params, lambda_ewc):
-    loss = 0.0
-    for n, p in model.named_parameters():
-        if n in fisher and n in opt_params:
-            loss = loss + (fisher[n].to(p.device) * (p - opt_params[n].to(p.device))**2).sum()
-    return 0.5 * lambda_ewc * loss
 
 def cas_reconfigure(model, k=8):
     # Toy CAS: perform SVD on fc2 weight (if exists) and modify last layer by zeroing small singular values
@@ -69,22 +77,19 @@ def cas_reconfigure(model, k=8):
         W = model.fc2.weight.data.clone()  # [num_classes, feat_dim]
         # compute SVD on small matrix (cpu)
         try:
-            U, S, Vt = torch.svd_lowrank(W, q=k)  # approximate low-rank
+            U, S, Vt = torch.svd_lowrank(W, q=min(k, min(W.shape)))
         except Exception:
             try:
                 U, S, Vt = torch.svd(W.cpu())
             except Exception:
                 return  # no-op if SVD fails
-        # reconstruct but shrink smaller singular values
         S_shrink = S.clone()
-        # zero out small singular values beyond k (toy)
         if S_shrink.numel() > k:
             S_shrink[k:] = 0.0
         W_new = U @ torch.diag(S_shrink) @ Vt.t()
         model.fc2.weight.data.copy_(W_new.to(model.fc2.weight.data.device))
 
 def run_experiment(config, method="ewc", seed=0, out_dir="results/run"):
-    import torch
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_tasks = config.get('dataset', {}).get('num_tasks', 5)
@@ -95,69 +100,39 @@ def run_experiment(config, method="ewc", seed=0, out_dir="results/run"):
     lambda_ewc = config.get('ewc', {}).get('lambda_ewc', 1000.0)
     cas_k = config.get('cas', {}).get('reconfig_k', 8)
 
+    # load tasks -- each task will yield labels remapped to 0..classes_per_task-1
     tasks = get_split_cifar_loaders(num_tasks=num_tasks, batch_size=batch_size,
                                     classes_per_task=classes_per_task, seed=seed)
 
-    # For simplicity, we build a fresh model for each task head: small workaround to handle changing num_classes
-    acc_matrix = []  # after training on task t, evaluate on tasks 0..t
+    # metrics accumulator: list of lists acc_matrix[t][i] = acc on task i after training on t
+    acc_matrix = []
     prev_params = None
     fisher_prev = None
 
-    model = None
+    # ensure out_dir exists (caller typically passes results/<method>_seedX)
+    os.makedirs(out_dir, exist_ok=True)
+
     for t, (train_loader, test_loader, cls) in enumerate(tasks):
-        # initialize model for current task with output size = classes_per_task
-        torch.cuda.empty_cache()
-        model = SmallCNN(num_classes=classes_per_task).to(device)
+        # dynamic number of classes for this task
+        num_classes = len(cls)
+        print(f"[seed={seed}] Task {t+1}/{len(tasks)} — classes: {num_classes}")
+
+        # build a fresh model for this task (simple approach for demo)
+        model = SmallCNN(num_classes=num_classes).to(device)
         optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
 
-        # If EWC: add penalty towards previous opt params using fisher_prev
-        if method == "ewc" and fisher_prev is not None and prev_params is not None:
-            # We'll train normally but include EWC penalty by manually adjusting grads
-            # Simple approach: compute loss + penalty in train loop below
-            pass
+        # Train on current task (with optional EWC penalty)
+        train_task_loop(model, train_loader, device, optimizer, epochs=epochs,
+                        ewc_fisher=fisher_prev, ewc_params=prev_params, lambda_ewc=lambda_ewc,
+                        method=method)
 
-        # Train for epochs
-        for epoch in range(epochs):
-            model.train()
-            for x, y in train_loader:
-                x, y = x.to(device), y.to(device)
-                optimizer.zero_grad()
-                out = model(x)
-                loss = nn.CrossEntropyLoss()(out, y)
-                # EWC penalty
-                if method == "ewc" and fisher_prev is not None and prev_params is not None:
-                    penalty = 0.0
-                    for n, p in model.named_parameters():
-                        if n in fisher_prev:
-                            penalty = penalty + (fisher_prev[n].to(p.device) * (p - prev_params[n].to(p.device))**2).sum()
-                    loss = loss + 0.5 * lambda_ewc * penalty
-                loss.backward()
-                optimizer.step()
-
-        # After training on task t, compute and store Fisher (approx) for EWC
-        # compute fisher using training loader (cheap approx)
+        # After training: compute fisher (if using EWC)
         if method == "ewc":
-            fisher_prev = {}
-            for n, p in model.named_parameters():
-                fisher_prev[n] = torch.zeros_like(p.data)
-            model.eval()
-            for x, y in train_loader:
-                x, y = x.to(device), y.to(device)
-                model.zero_grad()
-                out = model(x)
-                loss = nn.CrossEntropyLoss()(out, y)
-                loss.backward()
-                for n, p in model.named_parameters():
-                    if p.grad is not None:
-                        fisher_prev[n] += (p.grad.data.clone() ** 2)
-            # normalize
-            for n in fisher_prev:
-                fisher_prev[n] /= max(1.0, len(train_loader))
-
-            # save previous optimal params
+            fisher_prev = fisher_information(model, train_loader, device)
+            # store previous optimal params (on CPU for memory safety)
             prev_params = {n: p.data.clone().cpu() for n, p in model.named_parameters()}
 
-        # If CAS method, perform toy reconfiguration after finishing task training
+        # If CAS method, perform toy reconfiguration
         if method == "cas":
             cas_reconfigure(model, k=cas_k)
 
@@ -166,20 +141,22 @@ def run_experiment(config, method="ewc", seed=0, out_dir="results/run"):
         for i, (_, test_loader_i, _) in enumerate(tasks[:t+1]):
             acc = compute_accuracy(model, test_loader_i, device)
             accs.append(acc)
+
         acc_matrix.append(accs)
 
-        # Save interim checkpoint and metrics for this task
-        os.makedirs(out_dir, exist_ok=True)
-        ckpt = {
+        # Save interim metrics
+        run_metrics = {
             'task': t,
             'accs': accs
         }
         with open(os.path.join(out_dir, f"metrics_task{t}.json"), 'w') as f:
-            json.dump(ckpt, f)
+            json.dump(run_metrics, f)
 
     # Save aggregate metrics file
     with open(os.path.join(out_dir, "metrics_all.json"), 'w') as f:
         json.dump({'acc_matrix': acc_matrix}, f)
+
+    print(f"Run complete. Metrics written to {out_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

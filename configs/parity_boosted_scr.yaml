@@ -1,0 +1,10 @@
+include: parity_boosted.yaml
+
+hybrid:
+  use_replay: true
+  exemplar_per_class: 50
+  replay_fraction: 0.2
+
+scr:
+  enabled: true
+  selection_mode: "diversity"

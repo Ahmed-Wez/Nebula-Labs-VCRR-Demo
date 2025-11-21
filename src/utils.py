@@ -26,7 +26,6 @@ class RemappedSubset(Dataset):
     def __init__(self, base_dataset, indices, cls_map):
         self.dataset = base_dataset
         self.indices = indices
-        # mapping: original_label -> local_label
         self.label_to_local = {int(c): i for i, c in enumerate(cls_map)}
     def __len__(self):
         return len(self.indices)

@@ -1,0 +1,10 @@
+include: parity_boosted.yaml
+
+hybrid:
+  use_replay: true
+  exemplar_per_class: 50
+  replay_fraction: 0.0
+
+gdumb:
+  enabled: true
+  train_only_at_end: true

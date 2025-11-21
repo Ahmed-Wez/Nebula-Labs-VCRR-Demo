@@ -1,21 +1,20 @@
-# demo config: small, fast to run
 dataset:
   name: cifar100
-  num_tasks: 5  # split into 5 tasks to be quick
+  num_tasks: 5 
   classes_per_task: 20
 
 training:
-  epochs_per_task: 3   # small to keep demo fast
+  epochs_per_task: 3
   batch_size: 128
   lr: 0.01
   momentum: 0.9
   weight_decay: 5e-4
 
 ewc:
-  lambda_ewc: 1000.0  # regularization strength (toy value)
+  lambda_ewc: 1000.0
 
-cas:
-  reconfig_k: 8  # toy parameter controlling surgical subspace size
+vcrr:
+  reconfig_k: 8
 
 logging:
   save_checkpoints: true

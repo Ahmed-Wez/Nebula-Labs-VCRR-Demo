@@ -1,0 +1,7 @@
+include: parity_boosted.yaml
+
+vcrr:
+  reconfig_k: 64
+  soft_alpha: 0.0
+  apply_to: all_linear
+  randomized_svd: false

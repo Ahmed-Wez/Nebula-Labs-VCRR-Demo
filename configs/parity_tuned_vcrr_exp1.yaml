@@ -1,0 +1,36 @@
+dataset:
+  name: cifar100
+  num_tasks: 2
+  classes_per_task: 10
+
+training:
+  model: resnet34
+  epochs_per_task: 16
+  batch_size: 128
+  lr: 0.01
+  optimizer: sgd
+  momentum: 0.9
+  weight_decay: 5e-4
+  augment: true
+  mixup_alpha: 0.2
+  label_smoothing: 0.1
+  set_cudnn_benchmark: true
+  scheduler:
+    step_size: 3
+    gamma: 0.5
+
+hybrid:
+  use_replay: true
+  exemplar_per_class: 50
+  replay_fraction: 0.1
+  use_ewc_in_hybrid: false
+
+vcrr:
+  reconfig_k: 48
+  soft_alpha: 0.1
+  apply_to: all_linear
+  randomized_svd: false
+
+distill:
+  use_lwf: true
+  alpha: 0.5

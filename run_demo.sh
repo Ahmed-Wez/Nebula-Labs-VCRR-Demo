@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Config
 SEEDS=(0 1 2)
-METHODS=("ewc" "cas")
+METHODS=("ewc" "VCRR")
 OUTDIR="results"
 CONFIG="configs/demo.yaml"
 

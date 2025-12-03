@@ -4,6 +4,8 @@ import numpy as np
 import torch, torch.nn as nn, torch.optim as optim
 import torch.nn.functional as F
 from torchvision import datasets, transforms, models
+from torch.utils.data import Dataset, DataLoader, Subset
+from PIL import Image
 
 # ---------- utils ----------
 def set_seed(seed, deterministic=False):
@@ -14,8 +16,10 @@ def set_seed(seed, deterministic=False):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
+
 
 def maybe_reset_cuda_peak(dev):
     if dev.type == 'cuda':
@@ -23,6 +27,7 @@ def maybe_reset_cuda_peak(dev):
             torch.cuda.reset_peak_memory_stats(dev)
         except Exception:
             pass
+
 
 def maybe_get_cuda_peak_mb(dev):
     if dev.type == 'cuda':
@@ -33,9 +38,9 @@ def maybe_get_cuda_peak_mb(dev):
             return float('nan')
     return float('nan')
 
-# ---------- data helpers ----------
-def get_split_cifar_loaders(num_tasks=5, classes_per_task=20, batch_size=128, seed=0, num_workers=2, augment=True):
-    # transforms (canonical CIFAR100 normalization)
+
+# ---------- CIFAR-100 data helpers ----------
+def get_split_cifar100_loaders(num_tasks=5, classes_per_task=20, batch_size=128, seed=0, num_workers=2, augment=True):
     if augment:
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
@@ -54,7 +59,7 @@ def get_split_cifar_loaders(num_tasks=5, classes_per_task=20, batch_size=128, se
     ])
     root = "./data"
     trainset = datasets.CIFAR100(root=root, train=True, download=True)
-    testset  = datasets.CIFAR100(root=root, train=False, download=True)
+    testset = datasets.CIFAR100(root=root, train=False, download=True)
     rng = np.random.default_rng(seed)
     all_classes = list(range(100))
     perm = rng.permutation(all_classes).tolist()
@@ -63,7 +68,7 @@ def get_split_cifar_loaders(num_tasks=5, classes_per_task=20, batch_size=128, se
         cls = perm[t*classes_per_task:(t+1)*classes_per_task]
         cls_set = set(cls)
         train_idx = [i for i,(img,lab) in enumerate(trainset) if int(lab) in cls_set]
-        test_idx  = [i for i,(img,lab) in enumerate(testset) if int(lab) in cls_set]
+        test_idx = [i for i,(img,lab) in enumerate(testset) if int(lab) in cls_set]
         def build_subset(orig, indices, transform):
             imgs=[]; labs=[]
             for i in indices:
@@ -77,22 +82,316 @@ def get_split_cifar_loaders(num_tasks=5, classes_per_task=20, batch_size=128, se
             Y = torch.tensor(labs, dtype=torch.long)
             return torch.utils.data.TensorDataset(X,Y)
         ds_train = build_subset(trainset, train_idx, transform_train)
-        ds_test  = build_subset(testset, test_idx, transform_test)
+        ds_test = build_subset(testset, test_idx, transform_test)
         loader_train = torch.utils.data.DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-        loader_test  = torch.utils.data.DataLoader(ds_test,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        loader_test = torch.utils.data.DataLoader(ds_test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
         tasks.append((loader_train, loader_test, cls))
     return tasks
 
-# ---------- model ----------
+
+# ---------- CIFAR-10 data helpers ----------
+def get_split_cifar10_loaders(num_tasks=5, classes_per_task=2, batch_size=128, seed=0, num_workers=2, augment=True):
+    if augment:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914,0.4822,0.4465),(0.2470,0.2435,0.2616))
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914,0.4822,0.4465),(0.2470,0.2435,0.2616))
+        ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914,0.4822,0.4465),(0.2470,0.2435,0.2616))
+    ])
+    root = "./data"
+    trainset = datasets.CIFAR10(root=root, train=True, download=True)
+    testset = datasets.CIFAR10(root=root, train=False, download=True)
+    rng = np.random.default_rng(seed)
+    all_classes = list(range(10))
+    perm = rng.permutation(all_classes).tolist()
+    tasks = []
+    for t in range(num_tasks):
+        cls = perm[t*classes_per_task:(t+1)*classes_per_task]
+        cls_set = set(cls)
+        train_idx = [i for i,(img,lab) in enumerate(trainset) if int(lab) in cls_set]
+        test_idx = [i for i,(img,lab) in enumerate(testset) if int(lab) in cls_set]
+        def build_subset(orig, indices, transform):
+            imgs=[]; labs=[]
+            for i in indices:
+                img, lab = orig[i]
+                if transform: img = transform(img)
+                imgs.append(img)
+                labs.append(int(lab))
+            if len(imgs)==0:
+                return torch.utils.data.TensorDataset(torch.zeros((0,3,32,32)), torch.zeros((0,), dtype=torch.long))
+            X = torch.stack(imgs)
+            Y = torch.tensor(labs, dtype=torch.long)
+            return torch.utils.data.TensorDataset(X,Y)
+        ds_train = build_subset(trainset, train_idx, transform_train)
+        ds_test = build_subset(testset, test_idx, transform_test)
+        loader_train = torch.utils.data.DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        loader_test = torch.utils.data.DataLoader(ds_test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        tasks.append((loader_train, loader_test, cls))
+    return tasks
+
+
+# ---------- Permuted MNIST data helpers ----------
+class PermutedMNIST(Dataset):
+    def __init__(self, base_dataset, permutation=None):
+        self.base_dataset = base_dataset
+        self.permutation = permutation if permutation is not None else torch.arange(784)
+    
+    def __len__(self):
+        return len(self.base_dataset)
+    
+    def __getitem__(self, idx):
+        img, label = self.base_dataset[idx]
+        img_flat = img.view(-1)
+        img_permuted = img_flat[self.permutation].view(1, 28, 28)
+        return img_permuted, label
+
+
+def get_permuted_mnist_loaders(num_tasks=5, batch_size=128, seed=0, num_workers=2):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    root = "./data"
+    trainset = datasets.MNIST(root=root, train=True, download=True, transform=transform)
+    testset = datasets.MNIST(root=root, train=False, download=True, transform=transform)
+    
+    rng = np.random.default_rng(seed)
+    tasks = []
+    for t in range(num_tasks):
+        if t == 0:
+            perm = torch.arange(784)
+        else:
+            perm = torch.from_numpy(rng.permutation(784))
+        
+        train_permuted = PermutedMNIST(trainset, perm)
+        test_permuted = PermutedMNIST(testset, perm)
+        
+        loader_train = DataLoader(train_permuted, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        loader_test = DataLoader(test_permuted, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        tasks.append((loader_train, loader_test, list(range(10))))
+    return tasks
+
+
+# ---------- TinyImageNet data helpers ----------
+class TinyImageNetDataset(Dataset):
+    def __init__(self, root, train=True, transform=None, class_indices=None):
+        self.root = Path(root)
+        self.train = train
+        self.transform = transform
+        self.samples = []
+        
+        if train:
+            train_dir = self.root / 'train'
+            if not train_dir.exists():
+                print(f"Warning: TinyImageNet train directory not found at {train_dir}")
+                return
+            
+            all_classes = sorted([d.name for d in train_dir.iterdir() if d.is_dir()])
+            if class_indices is not None:
+                selected_classes = [all_classes[i] for i in class_indices if i < len(all_classes)]
+            else:
+                selected_classes = all_classes
+            
+            for cls_name in selected_classes:
+                cls_dir = train_dir / cls_name / 'images'
+                if cls_dir.exists():
+                    for img_path in cls_dir.glob('*.JPEG'):
+                        self.samples.append((str(img_path), all_classes.index(cls_name)))
+        else:
+            val_dir = self.root / 'val'
+            if not val_dir.exists():
+                print(f"Warning: TinyImageNet val directory not found at {val_dir}")
+                return
+            
+            val_annotations = val_dir / 'val_annotations.txt'
+            if val_annotations.exists():
+                with open(val_annotations, 'r') as f:
+                    val_data = [line.strip().split('\t') for line in f]
+                
+                all_classes = sorted(list(set([x[1] for x in val_data])))
+                if class_indices is not None:
+                    selected_classes = set([all_classes[i] for i in class_indices if i < len(all_classes)])
+                else:
+                    selected_classes = set(all_classes)
+                
+                for img_name, cls_name, *_ in val_data:
+                    if cls_name in selected_classes:
+                        img_path = val_dir / 'images' / img_name
+                        if img_path.exists():
+                            self.samples.append((str(img_path), all_classes.index(cls_name)))
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        img = Image.open(img_path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+def get_split_tinyimagenet_loaders(num_tasks=10, classes_per_task=20, batch_size=128, seed=0, num_workers=2, augment=True):
+    if augment:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(64, padding=8),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225))
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225))
+        ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225))
+    ])
+    
+    root = "./data/tiny-imagenet-200"
+    if not Path(root).exists():
+        print(f"Warning: TinyImageNet not found at {root}. Please download it first.")
+        print("Download from: http://cs231n.stanford.edu/tiny-imagenet-200.zip")
+        return []
+    
+    rng = np.random.default_rng(seed)
+    all_classes = list(range(200))
+    perm = rng.permutation(all_classes).tolist()
+    
+    tasks = []
+    for t in range(num_tasks):
+        cls = perm[t*classes_per_task:(t+1)*classes_per_task]
+        
+        trainset = TinyImageNetDataset(root, train=True, transform=transform_train, class_indices=cls)
+        testset = TinyImageNetDataset(root, train=False, transform=transform_test, class_indices=cls)
+        
+        loader_train = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        loader_test = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        tasks.append((loader_train, loader_test, cls))
+    
+    return tasks
+
+
+# ---------- CORe50 data helpers ----------
+class CORe50Dataset(Dataset):
+    def __init__(self, root, train=True, transform=None, scenario='ni', run=0, task_id=0):
+        self.root = Path(root)
+        self.train = train
+        self.transform = transform
+        self.samples = []
+        
+        # CORe50 has different scenarios: 'ni' (new instances), 'nc' (new classes), etc.
+        # For simplicity, we'll implement 'nc' scenario with 10 tasks × 5 classes
+        paths_file = self.root / f'core50_{"train" if train else "test"}.txt'
+        
+        if not paths_file.exists():
+            print(f"Warning: CORe50 data file not found at {paths_file}")
+            print("Please download CORe50 dataset from: https://vlomonaco.github.io/core50/")
+            return
+        
+        # Load all data and filter by task
+        with open(paths_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    img_path, label = parts[0], int(parts[1])
+                    # Simple task assignment: divide 50 classes into tasks
+                    if label // 5 == task_id:
+                        full_path = self.root / img_path
+                        if full_path.exists():
+                            self.samples.append((str(full_path), label))
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        img = Image.open(img_path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+def get_core50_loaders(num_tasks=10, batch_size=128, seed=0, num_workers=2, augment=True):
+    if augment:
+        transform_train = transforms.Compose([
+            transforms.Resize((128, 128)),
+            transforms.RandomCrop(128, padding=16),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225))
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225))
+        ])
+    transform_test = transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225))
+    ])
+    
+    root = "./data/core50"
+    if not Path(root).exists():
+        print(f"Warning: CORe50 not found at {root}. Returning empty task list.")
+        return []
+    
+    tasks = []
+    for t in range(num_tasks):
+        trainset = CORe50Dataset(root, train=True, transform=transform_train, task_id=t)
+        testset = CORe50Dataset(root, train=False, transform=transform_test, task_id=t)
+        
+        loader_train = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        loader_test = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        
+        # Classes for this task
+        cls = list(range(t*5, (t+1)*5))
+        tasks.append((loader_train, loader_test, cls))
+    
+    return tasks
+
+
+# ---------- Unified data loader getter ----------
+def get_benchmark_loaders(dataset_name='cifar100', num_tasks=5, classes_per_task=20, batch_size=128, seed=0, num_workers=2, augment=True):
+    dataset_name = dataset_name.lower()
+    
+    if dataset_name == 'cifar100':
+        return get_split_cifar100_loaders(num_tasks, classes_per_task, batch_size, seed, num_workers, augment)
+    elif dataset_name == 'cifar10':
+        return get_split_cifar10_loaders(num_tasks, classes_per_task, batch_size, seed, num_workers, augment)
+    elif dataset_name == 'permuted_mnist' or dataset_name == 'permutedmnist':
+        return get_permuted_mnist_loaders(num_tasks, batch_size, seed, num_workers)
+    elif dataset_name == 'tinyimagenet' or dataset_name == 'tiny_imagenet':
+        return get_split_tinyimagenet_loaders(num_tasks, classes_per_task, batch_size, seed, num_workers, augment)
+    elif dataset_name == 'core50':
+        return get_core50_loaders(num_tasks, batch_size, seed, num_workers, augment)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+# ---------- models ----------
 class SmallCNN(nn.Module):
-    def __init__(self, num_classes=100):
+    def __init__(self, num_classes=100, input_channels=3):
         super().__init__()
-        self.conv1 = nn.Conv2d(3,64,3,padding=1)
+        self.conv1 = nn.Conv2d(input_channels,64,3,padding=1)
         self.conv2 = nn.Conv2d(64,128,3,padding=1)
         self.pool = nn.MaxPool2d(2,2)
         self.adaptive_pool = nn.AdaptiveAvgPool2d((4,4))
         self.fc1 = nn.Linear(128*4*4,256)
         self.fc2 = nn.Linear(256,num_classes)
+    
     def forward(self,x):
         x = torch.relu(self.conv1(x))
         x = self.pool(torch.relu(self.conv2(x)))
@@ -101,27 +400,55 @@ class SmallCNN(nn.Module):
         x = torch.relu(self.fc1(feat))
         return self.fc2(x)
 
-def get_model(backbone='smallcnn', total_classes=100):
-    if backbone == 'resnet18':
+
+class MLP(nn.Module):
+    def __init__(self, input_size=784, hidden_sizes=[256, 256], num_classes=10):
+        super().__init__()
+        layers = []
+        prev_size = input_size
+        for h in hidden_sizes:
+            layers.append(nn.Linear(prev_size, h))
+            layers.append(nn.ReLU())
+            prev_size = h
+        layers.append(nn.Linear(prev_size, num_classes))
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        return self.network(x)
+
+
+def get_model(backbone='smallcnn', total_classes=100, input_channels=3, input_size=784):
+    if backbone == 'mlp':
+        return MLP(input_size=input_size, num_classes=total_classes)
+    elif backbone == 'resnet18':
         net = models.resnet18(pretrained=False)
+        if input_channels != 3:
+            net.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         net.fc = nn.Linear(net.fc.in_features, total_classes)
         return net
     elif backbone == 'resnet34':
         net = models.resnet34(pretrained=False)
+        if input_channels != 3:
+            net.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         net.fc = nn.Linear(net.fc.in_features, total_classes)
         return net
     elif backbone == 'resnet50':
         net = models.resnet50(pretrained=False)
+        if input_channels != 3:
+            net.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         net.fc = nn.Linear(net.fc.in_features, total_classes)
         return net
     else:
-        return SmallCNN(num_classes=total_classes)
+        return SmallCNN(num_classes=total_classes, input_channels=input_channels)
 
-# ---------- Exemplar buffer ----------
+
+# ---------- Exemplar buffer (for ER, iCaRL, etc.) ----------
 class ExemplarBuffer:
     def __init__(self, per_class=20):
         self.per_class = int(per_class)
         self.store = {}
+    
     def add_examples(self, xs_cpu, ys_cpu):
         for x,y in zip(xs_cpu, ys_cpu):
             g = int(y.item())
@@ -130,10 +457,10 @@ class ExemplarBuffer:
             if len(lst) < self.per_class:
                 lst.append(x.clone())
             else:
-                # small random replacement
                 if random.random() < 0.01:
                     idx = random.randrange(len(lst))
                     lst[idx] = x.clone()
+    
     def sample(self, n_total):
         if len(self.store)==0: return None, None
         classes = list(self.store.keys())
@@ -152,12 +479,56 @@ class ExemplarBuffer:
         X = torch.stack(xs_list)[:n_total]
         Y = torch.tensor(ys_list[:n_total], dtype=torch.long)
         return X, Y
+    
+    def get_all(self):
+        """Return all stored examples"""
+        xs_list = []
+        ys_list = []
+        for c, lst in self.store.items():
+            for x in lst:
+                xs_list.append(x)
+                ys_list.append(c)
+        if len(xs_list) == 0:
+            return None, None
+        return torch.stack(xs_list), torch.tensor(ys_list, dtype=torch.long)
+    
     def __len__(self):
         return sum(len(v) for v in self.store.values())
 
+
+# ---------- DER++ buffer (stores logits) ----------
+class DERBuffer:
+    def __init__(self, max_size=2000):
+        self.max_size = max_size
+        self.examples = []
+        self.labels = []
+        self.logits = []
+    
+    def add_data(self, examples, labels, logits):
+        for e, l, log in zip(examples, labels, logits):
+            if len(self.examples) < self.max_size:
+                self.examples.append(e.cpu().clone())
+                self.labels.append(l.cpu().clone())
+                self.logits.append(log.cpu().clone())
+            else:
+                idx = random.randint(0, len(self.examples) - 1)
+                self.examples[idx] = e.cpu().clone()
+                self.labels[idx] = l.cpu().clone()
+                self.logits[idx] = log.cpu().clone()
+    
+    def sample(self, n):
+        if len(self.examples) == 0:
+            return None, None, None
+        n = min(n, len(self.examples))
+        indices = np.random.choice(len(self.examples), n, replace=False)
+        batch_x = torch.stack([self.examples[i] for i in indices])
+        batch_y = torch.stack([self.labels[i] for i in indices])
+        batch_logits = torch.stack([self.logits[i] for i in indices])
+        return batch_x, batch_y, batch_logits
+
+
 # ---------- VCRR ----------
 def vcrr_reconfigure_all_linears(model, k=8, soft_alpha=0.0, randomized=False, skip_output_linear=True, num_classes=None):
-    """Continual Adaptation through Selective reconfiguration via SVD rank reduction"""
     for name, m in model.named_modules():
         if isinstance(m, nn.Linear):
             try:
@@ -187,7 +558,8 @@ def vcrr_reconfigure_all_linears(model, k=8, soft_alpha=0.0, randomized=False, s
             except Exception:
                 continue
 
-# ---------- Fisher ----------
+
+# ---------- Fisher information (for EWC) ----------
 def fisher_information(model, loader, device, max_batches=100):
     model.eval()
     fisher = {n: torch.zeros_like(p.data).to('cpu') for n,p in model.named_parameters()}
@@ -208,6 +580,132 @@ def fisher_information(model, loader, device, max_batches=100):
         for n in fisher: fisher[n] /= float(count)
     return fisher
 
+
+# ---------- PackNet helpers ----------
+def packnet_get_free_capacity(model, masks):
+    """Calculate remaining capacity in the network"""
+    total = 0
+    free = 0
+    for name, param in model.named_parameters():
+        if 'weight' in name:
+            total += param.numel()
+            if name in masks:
+                free += (masks[name] == 0).sum().item()
+            else:
+                free += param.numel()
+    return free / total if total > 0 else 0
+
+
+def packnet_compute_importance(model, loader, device, num_batches=50):
+    """Compute parameter importance for PackNet"""
+    model.eval()
+    importance = {}
+    for name, param in model.named_parameters():
+        if 'weight' in name:
+            importance[name] = torch.zeros_like(param.data)
+    
+    count = 0
+    for x, y in loader:
+        if count >= num_batches:
+            break
+        x, y = x.to(device), y.to(device)
+        model.zero_grad()
+        out = model(x)
+        loss = F.cross_entropy(out, y)
+        loss.backward()
+        
+        for name, param in model.named_parameters():
+            if 'weight' in name and param.grad is not None:
+                importance[name] += param.grad.data.abs()
+        count += 1
+    
+    for name in importance:
+        importance[name] /= count
+    return importance
+
+
+def packnet_create_mask(importance, existing_masks, prune_perc=0.5):
+    """Create pruning mask for PackNet"""
+    new_masks = {}
+    for name, imp in importance.items():
+        existing = existing_masks.get(name, torch.zeros_like(imp))
+        available = (existing == 0)
+        
+        if available.sum() == 0:
+            new_masks[name] = existing
+            continue
+        
+        imp_available = imp.clone()
+        imp_available[~available] = float('inf')
+        
+        k = max(1, int(available.sum().item() * prune_perc))
+        threshold = torch.topk(imp_available.flatten(), k, largest=False)[0][-1]
+        
+        new_mask = existing.clone()
+        new_mask[(imp <= threshold) & available] = 1
+        new_masks[name] = new_mask
+    
+    return new_masks
+
+
+def packnet_apply_mask(model, masks):
+    """Apply masks to model weights"""
+    for name, param in model.named_parameters():
+        if name in masks:
+            param.data *= (1 - masks[name].to(param.device))
+
+
+# ---------- A-GEM helpers ----------
+def agem_project_gradient(current_grads, memory_grads):
+    """Project gradients to not interfere with memory"""
+    dot_product = sum((cg * mg).sum() for cg, mg in zip(current_grads, memory_grads))
+    
+    if dot_product < 0:
+        memory_norm = sum((mg ** 2).sum() for mg in memory_grads)
+        projection_coef = dot_product / (memory_norm + 1e-8)
+        projected_grads = [cg - projection_coef * mg for cg, mg in zip(current_grads, memory_grads)]
+        return projected_grads
+    return current_grads
+
+
+# ---------- ProgNN (Progressive Neural Networks) ----------
+class ProgNNColumn(nn.Module):
+    """Single column for Progressive Neural Networks"""
+    def __init__(self, input_size, hidden_sizes, num_classes, lateral_connections=None):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.lateral_adapters = nn.ModuleList() if lateral_connections else None
+        
+        prev_size = input_size
+        for i, h in enumerate(hidden_sizes):
+            self.layers.append(nn.Linear(prev_size, h))
+            
+            if lateral_connections and i < len(lateral_connections):
+                adapter_input = sum([prev_col_size for prev_col_size in lateral_connections[i]])
+                if adapter_input > 0:
+                    self.lateral_adapters.append(nn.Linear(adapter_input, h))
+                else:
+                    self.lateral_adapters.append(None)
+            prev_size = h
+        
+        self.output = nn.Linear(prev_size, num_classes)
+    
+    def forward(self, x, lateral_inputs=None):
+        activations = []
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            
+            if lateral_inputs and self.lateral_adapters and i < len(self.lateral_adapters):
+                if self.lateral_adapters[i] is not None and len(lateral_inputs[i]) > 0:
+                    lateral_h = torch.cat(lateral_inputs[i], dim=1)
+                    x = x + self.lateral_adapters[i](lateral_h)
+            
+            x = F.relu(x)
+            activations.append(x)
+        
+        return self.output(x), activations
+
+
 # ---------- accuracy / mixup ----------
 def compute_accuracy(model, loader, device):
     model.eval()
@@ -221,6 +719,7 @@ def compute_accuracy(model, loader, device):
             total += y.size(0)
     return 100.0 * correct / total if total>0 else 0.0
 
+
 def mixup_data(x, y, alpha=0.2):
     if alpha <= 0.0:
         return x, y, None, 1.0
@@ -233,10 +732,12 @@ def mixup_data(x, y, alpha=0.2):
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
+
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     if y_b is None:
         return criterion(pred, y_a)
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
 
 # ---------- HOPE helpers ----------
 def hope_register_hooks(model, apply_to='fc_only'):
@@ -272,13 +773,14 @@ def hope_register_hooks(model, apply_to='fc_only'):
                     hooks.append(m.register_backward_hook(make_bhook(m)))
     return target_modules, forward_inputs, backward_grads, hooks
 
+
 def hope_apply_batch_update(target_modules, forward_inputs, backward_grads, eta=0.01, normalize_inputs=True):
     for m in target_modules:
         key = id(m)
         if key not in forward_inputs or key not in backward_grads:
             continue
-        x = forward_inputs[key]      # cpu
-        g_out = backward_grads[key]  # cpu
+        x = forward_inputs[key]
+        g_out = backward_grads[key]
         if x.numel() == 0 or g_out.numel() == 0:
             continue
         dev = m.weight.data.device
@@ -298,13 +800,14 @@ def hope_apply_batch_update(target_modules, forward_inputs, backward_grads, eta=
             W_new = W_new - float(eta) * torch.ger(g_mean, x_mean)
             m.weight.data.copy_(W_new)
 
+
 # ---------- main experiment runner ----------
 def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_classes=100, deterministic=False):
     t0 = time.time()
     set_seed(seed, deterministic=deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # read style safely
+    # Parse config
     dataset_cfg = cfg.get('dataset',{}) or {}
     training_cfg = cfg.get('training',{}) or {}
     vcrr_cfg = cfg.get('vcrr',{}) or {}
@@ -312,37 +815,86 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     ewc_cfg = cfg.get('ewc',{}) or {}
     hope_cfg = cfg.get('hope',{}) or {}
     distill_cfg = cfg.get('distill',{}) or {}
+    packnet_cfg = cfg.get('packnet',{}) or {}
+    er_cfg = cfg.get('er',{}) or {}
+    agem_cfg = cfg.get('agem',{}) or {}
+    der_cfg = cfg.get('der',{}) or {}
+    prognn_cfg = cfg.get('prognn',{}) or {}
 
-    num_tasks = int(dataset_cfg.get('num_tasks',5))
-    classes_per_task = int(dataset_cfg.get('classes_per_task',20))
-    batch_size = int(training_cfg.get('batch_size',128))
-    epochs = int(training_cfg.get('epochs_per_task',1))
-    lr = float(training_cfg.get('lr',0.01))
-    backbone = training_cfg.get('model','smallcnn')
-    vcrr_k = int(vcrr_cfg.get('reconfig_k',8))
-    vcrr_soft_alpha = float(vcrr_cfg.get('soft_alpha',0.0))
-    vcrr_apply = vcrr_cfg.get('apply_to','all_linear')
+    # Dataset parameters
+    dataset_name = dataset_cfg.get('name', 'cifar100')
+    num_tasks = int(dataset_cfg.get('num_tasks', 5))
+    classes_per_task = int(dataset_cfg.get('classes_per_task', 20))
+    batch_size = int(training_cfg.get('batch_size', 128))
+    epochs = int(training_cfg.get('epochs_per_task', 1))
+    lr = float(training_cfg.get('lr', 0.01))
+    backbone = training_cfg.get('model', 'smallcnn')
+    
+    # Determine input specs based on dataset
+    if dataset_name.lower() in ['permuted_mnist', 'permutedmnist']:
+        input_channels = 1
+        input_size = 784
+        if backbone == 'smallcnn':
+            backbone = 'mlp'
+    elif dataset_name.lower() in ['tinyimagenet', 'tiny_imagenet']:
+        input_channels = 3
+        input_size = 64 * 64 * 3
+    elif dataset_name.lower() == 'core50':
+        input_channels = 3
+        input_size = 128 * 128 * 3
+    else:
+        input_channels = 3
+        input_size = 32 * 32 * 3
+
+    # VCRR params
+    vcrr_k = int(vcrr_cfg.get('reconfig_k', 8))
+    vcrr_soft_alpha = float(vcrr_cfg.get('soft_alpha', 0.0))
+    vcrr_apply = vcrr_cfg.get('apply_to', 'all_linear')
     randomized_svd = bool(vcrr_cfg.get('randomized_svd', False))
     vcrr_skip_output = bool(vcrr_cfg.get('skip_output_linear', True))
 
+    # Replay/hybrid params
     use_replay = bool(hybrid_cfg.get('use_replay', False))
-    exemplar_per_class = int(hybrid_cfg.get('exemplar_per_class',20))
-    replay_fraction = float(hybrid_cfg.get('replay_fraction',0.1))
+    exemplar_per_class = int(hybrid_cfg.get('exemplar_per_class', 20))
+    replay_fraction = float(hybrid_cfg.get('replay_fraction', 0.1))
     use_ewc_in_hybrid = bool(hybrid_cfg.get('use_ewc_in_hybrid', False))
-    lambda_ewc = float(ewc_cfg.get('lambda_ewc',1000.0))
+    
+    # EWC params
+    lambda_ewc = float(ewc_cfg.get('lambda_ewc', 1000.0))
 
+    # Training params
     mixup_alpha = float(training_cfg.get('mixup_alpha', 0.0))
     label_smoothing = float(training_cfg.get('label_smoothing', 0.0))
-    optimizer_name = training_cfg.get('optimizer','sgd')
+    optimizer_name = training_cfg.get('optimizer', 'sgd')
     scheduler_cfg = training_cfg.get('scheduler', None)
-    use_amp = bool(training_cfg.get('use_amp', False))
     set_cudnn_benchmark = bool(training_cfg.get('set_cudnn_benchmark', False))
     augment = bool(training_cfg.get('augment', True))
 
-    # distillation (LwF style)
-    use_lwf = bool(distill_cfg.get('use_lwf', False))
+    # LwF params
+    use_lwf = bool(distill_cfg.get('use_lwf', False)) or (method == 'lwf')
     distill_alpha = float(distill_cfg.get('alpha', 0.5))
+    distill_temperature = float(distill_cfg.get('temperature', 2.0))
 
+    # PackNet params
+    packnet_prune_perc = float(packnet_cfg.get('prune_percentage', 0.5))
+    packnet_retrain_epochs = int(packnet_cfg.get('retrain_epochs', 5))
+
+    # ER params (Experience Replay - simple version)
+    er_buffer_size = int(er_cfg.get('buffer_size', 2000))
+
+    # A-GEM params
+    agem_buffer_size = int(agem_cfg.get('buffer_size', 2000))
+    agem_sample_size = int(agem_cfg.get('sample_size', 256))
+
+    # DER++ params
+    der_buffer_size = int(der_cfg.get('buffer_size', 2000))
+    der_alpha = float(der_cfg.get('alpha', 0.5))
+    der_beta = float(der_cfg.get('beta', 0.5))
+
+    # ProgNN params
+    prognn_hidden_sizes = prognn_cfg.get('hidden_sizes', [256, 256])
+
+    # HOPE params
     hope_eta = float(hope_cfg.get('eta', 0.01))
     hope_apply_to = hope_cfg.get('apply_to', 'fc_only')
     hope_use_with_opt = bool(hope_cfg.get('use_with_optimizer', True))
@@ -351,32 +903,52 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     if set_cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
 
-    # loaders
-    tasks = get_split_cifar_loaders(num_tasks=num_tasks, classes_per_task=classes_per_task, batch_size=batch_size, seed=seed, augment=augment)
+    # Get data loaders
+    tasks = get_benchmark_loaders(
+        dataset_name=dataset_name,
+        num_tasks=num_tasks,
+        classes_per_task=classes_per_task,
+        batch_size=batch_size,
+        seed=seed,
+        augment=augment
+    )
+    
+    if len(tasks) == 0:
+        print(f"ERROR: No tasks loaded for dataset {dataset_name}")
+        return
+
     expected_steps = 0
-    for loader,_,_ in tasks:
+    for loader, _, _ in tasks:
         try:
             expected_steps += len(loader) * epochs
         except Exception:
             pass
 
-    model = get_model(backbone, total_classes).to(device)
-    n_params = count_params(model)
-
-    # optimizer
-    weight_decay = float(training_cfg.get('weight_decay',5e-4))
-    if optimizer_name.lower() == 'adamw':
-        opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Initialize model
+    if method == 'prognn':
+        # ProgNN uses multiple columns
+        prognn_columns = []
+        prognn_task_heads = []
     else:
-        momentum = float(training_cfg.get('momentum', 0.9))
-        opt = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        model = get_model(backbone, total_classes, input_channels, input_size).to(device)
+        n_params = count_params(model)
 
-    scheduler = None
-    if scheduler_cfg:
-        step_size = int(scheduler_cfg.get('step_size', 4))
-        gamma = float(scheduler_cfg.get('gamma', 0.5))
-        scheduler = optim.lr_scheduler.StepLR(opt, step_size=step_size, gamma=gamma)
+    # Optimizer setup
+    weight_decay = float(training_cfg.get('weight_decay', 5e-4))
+    if method != 'prognn':
+        if optimizer_name.lower() == 'adamw':
+            opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            momentum = float(training_cfg.get('momentum', 0.9))
+            opt = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
 
+        scheduler = None
+        if scheduler_cfg:
+            step_size = int(scheduler_cfg.get('step_size', 4))
+            gamma = float(scheduler_cfg.get('gamma', 0.5))
+            scheduler = optim.lr_scheduler.StepLR(opt, step_size=step_size, gamma=gamma)
+
+    # Loss function
     if label_smoothing > 0.0:
         try:
             loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -385,242 +957,466 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     else:
         loss_fn = nn.CrossEntropyLoss()
 
-    replay_buf = ExemplarBuffer(per_class=exemplar_per_class) if use_replay else None
+    # Initialize method-specific components
+    replay_buf = None
+    der_buffer = None
+    agem_buffer = None
+    packnet_masks = {}
+    
+    if method in ['er', 'hybrid'] or use_replay:
+        replay_buf = ExemplarBuffer(per_class=exemplar_per_class)
+    
+    if method == 'der':
+        der_buffer = DERBuffer(max_size=der_buffer_size)
+    
+    if method == 'agem':
+        agem_buffer = ExemplarBuffer(per_class=agem_buffer_size // (num_tasks * classes_per_task))
 
-    # HOPE hooks registration
-    hope_target_modules, hope_forward_inputs, hope_backward_grads, hope_hooks = hope_register_hooks(model, apply_to=hope_apply_to)
+    # HOPE hooks
+    if method != 'prognn':
+        hope_target_modules, hope_forward_inputs, hope_backward_grads, hope_hooks = hope_register_hooks(model, apply_to=hope_apply_to)
 
+    # EWC storage
     fisher_sum = {}
     prev_params = {}
+    
+    # LwF prev model
+    prev_model = None
+    
     tasks_seen = 0
     acc_matrix = []
     os.makedirs(out_dir, exist_ok=True)
-
     epoch_times = []
     maybe_reset_cuda_peak(device)
 
-    # prev_model for LwF-style distillation
-    prev_model = None
-
+    # Main training loop
     for t, (train_loader, test_loader, cls_list) in enumerate(tasks):
         print(f"[seed={seed}] Training task {t+1}/{num_tasks} classes={len(cls_list)} method={method}")
 
-        if use_lwf and prev_model is None and tasks_seen > 0:
-            pass
-
-        for epoch in range(epochs):
-            e0 = time.time()
-            model.train()
-            for xb,yb in train_loader:
-                xb,yb = xb.to(device), yb.to(device)
-
-                # MixUp on the ORIGINAL minibatch
-                if mixup_alpha > 0.0:
-                    xb_mix, y_a, y_b, lam = mixup_data(xb, yb, mixup_alpha)
-                    xb = xb_mix
-                else:
-                    y_a = None; y_b = None; lam = 1.0
-
-                # initialize merged label vars
-                y_all = None
-                y_all_a = None
-                y_all_b = None
-
-                # replay merge
-                if replay_buf is not None and len(replay_buf) > 0:
-                    rep_n = max(1, int(replay_fraction * xb.size(0)))
-                    xr, yr = replay_buf.sample(rep_n)
-                    if xr is not None:
-                        xr = xr.to(device); yr = yr.to(device)
-                        x_all = torch.cat([xb, xr], dim=0)
-                        # create merged labels depending on whether mixup active
-                        if mixup_alpha > 0.0:
-                            try:
-                                y_all_a = torch.cat([y_a, yr], dim=0)
-                            except Exception:
-                                y_all_a = torch.cat([ (y_a if y_a is not None else yb), yr ], dim=0)
-                            if y_b is not None:
-                                try:
-                                    y_all_b = torch.cat([y_b, yr], dim=0)
-                                except Exception:
-                                    y_all_b = None
-                            else:
-                                y_all_b = None
-                        else:
-                            y_all = torch.cat([yb, yr], dim=0)
-                    else:
-                        # replay sampling returned nothing
-                        x_all = xb
-                        if mixup_alpha > 0.0:
-                            y_all_a = y_a
-                            y_all_b = y_b
-                        else:
-                            y_all = yb
-                else:
-                    # no replay
-                    x_all = xb
-                    if mixup_alpha > 0.0:
-                        y_all_a = y_a
-                        y_all_b = y_b
-                    else:
-                        y_all = yb
-
-                opt.zero_grad()
-                out = model(x_all)
-
-                # compute supervised loss
-                if mixup_alpha > 0.0:
-                    if y_all_a is None:
-                        y_all_a = y_a
-                    if y_all_b is None and y_b is None:
-                        y_all_b = None
-                    if y_all_b is None:
-                        if y_all_a is None:
-                            loss = loss_fn(out, yb.to(device))
-                        else:
-                            loss = mixup_criterion(loss_fn, out, y_all_a.to(device), y_all_b.to(device) if y_all_b is not None else None, lam)
-                    else:
-                        loss = mixup_criterion(loss_fn, out, y_all_a.to(device), y_all_b.to(device), lam)
-                else:
-                    loss = loss_fn(out, y_all.to(device))
-
-                # EWC penalty
-                if (method == 'ewc' and tasks_seen > 0) or (method == 'hybrid' and use_ewc_in_hybrid and tasks_seen > 0):
-                    pen = 0.0
-                    for n, p in model.named_parameters():
-                        if n in fisher_sum and n in prev_params:
-                            pen += (fisher_sum[n].to(p.device) * (p - prev_params[n].to(p.device))**2).sum()
-                    loss = loss + 0.5 * lambda_ewc * pen
-
-                # LwF-style distillation loss
-                if use_lwf and (prev_model is not None):
-                    try:
-                        with torch.no_grad():
-                            t_logits = prev_model(x_all.to(device))
-                        kl = nn.KLDivLoss(reduction='batchmean')
-                        loss = loss + float(distill_alpha) * kl(F.log_softmax(out, dim=1), F.softmax(t_logits, dim=1))
-                    except Exception:
-                        pass
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-
-                # HOPE application logic
-                if method == 'hope' or (method == 'hybrid' and cfg.get('hybrid',{}).get('use_hope_in_hybrid', False)):
-                    hope_apply_batch_update(hope_target_modules, hope_forward_inputs, hope_backward_grads, eta=hope_eta, normalize_inputs=hope_normalize)
-                    if not hope_use_with_opt:
-                        for p in model.parameters():
-                            if p.grad is not None:
-                                p.grad = None
-
-                # optimizer step
-                if hope_use_with_opt or method != 'hope':
-                    opt.step()
-
-            e1 = time.time()
-            epoch_times.append(e1 - e0)
-            if scheduler is not None:
-                scheduler.step()
-
-        # update replay buffer
-        if replay_buf is not None:
-            for xb, yb in train_loader:
-                replay_buf.add_examples(xb.cpu(), yb.cpu())
-
-        # EWC fisher update
-        if method == 'ewc' or (method == 'hybrid' and use_ewc_in_hybrid):
-            fisher_t = fisher_information(model, train_loader, device, max_batches=200)
-            if tasks_seen == 0:
-                for n in fisher_t: fisher_sum[n] = fisher_t[n].cpu()
+        # ProgNN: create new column
+        if method == 'prognn':
+            if t == 0:
+                lateral_connections = None
             else:
-                for n in fisher_t:
-                    fisher_sum[n] = (fisher_sum[n] * tasks_seen + fisher_t[n].cpu()) / float(tasks_seen + 1)
-            prev_params = {n: p.data.clone().cpu() for n,p in model.named_parameters()}
+                # Calculate lateral connection sizes
+                lateral_connections = []
+                for layer_idx in range(len(prognn_hidden_sizes)):
+                    prev_layer_sizes = [prognn_hidden_sizes[layer_idx] for _ in range(len(prognn_columns))]
+                    lateral_connections.append(prev_layer_sizes)
+            
+            new_column = ProgNNColumn(
+                input_size=input_size,
+                hidden_sizes=prognn_hidden_sizes,
+                num_classes=total_classes,
+                lateral_connections=lateral_connections
+            ).to(device)
+            
+            prognn_columns.append(new_column)
+            
+            # Freeze previous columns
+            for prev_col in prognn_columns[:-1]:
+                for param in prev_col.parameters():
+                    param.requires_grad = False
+            
+            # Optimizer for new column
+            opt = optim.SGD(new_column.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+            scheduler = None
+            if scheduler_cfg:
+                step_size = int(scheduler_cfg.get('step_size', 4))
+                gamma = float(scheduler_cfg.get('gamma', 0.5))
+                scheduler = optim.lr_scheduler.StepLR(opt, step_size=step_size, gamma=gamma)
 
-        # VCRR reconfiguration
-        if method in ('vcrr', 'hybrid'):
-            vcrr_reconfigure_all_linears(model, k=vcrr_k, soft_alpha=vcrr_soft_alpha, randomized=randomized_svd, skip_output_linear=vcrr_skip_output, num_classes=total_classes)
+        # PackNet: Compute importance and create masks
+        if method == 'packnet' and t > 0:
+            importance = packnet_compute_importance(model, train_loader, device)
+            packnet_masks = packnet_create_mask(importance, packnet_masks, packnet_prune_perc)
+            packnet_apply_mask(model, packnet_masks)
 
-        # set prev_model snapshot for LwF
-        if use_lwf:
-            try:
-                prev_model = copy.deepcopy(model).to(device)
+        # LwF: Store previous model
+        if (use_lwf or method == 'lwf') and t > 0 and prev_model is None:
+            prev_model = copy.deepcopy(model)
+            prev_model.eval()
+
+        # Train for this task
+        for epoch in range(epochs):
+            epoch_start = time.time()
+            
+            if method == 'prognn':
+                new_column.train()
+                train_loss = 0.0
+                for batch_idx, (x, y) in enumerate(train_loader):
+                    x, y = x.to(device), y.to(device)
+                    
+                    # Get lateral inputs from previous columns
+                    lateral_inputs = [[] for _ in range(len(prognn_hidden_sizes))]
+                    if t > 0:
+                        with torch.no_grad():
+                            for prev_col in prognn_columns[:-1]:
+                                _, prev_activations = prev_col(x, None)
+                                for layer_idx in range(len(prognn_hidden_sizes)):
+                                    if layer_idx < len(prev_activations):
+                                        lateral_inputs[layer_idx].append(prev_activations[layer_idx])
+                    
+                    opt.zero_grad()
+                    out, _ = new_column(x, lateral_inputs)
+                    loss = loss_fn(out, y)
+                    loss.backward()
+                    opt.step()
+                    train_loss += loss.item()
+                
+                if scheduler:
+                    scheduler.step()
+                
+            else:
+                model.train()
+                train_loss = 0.0
+                
+                for batch_idx, (x, y) in enumerate(train_loader):
+                    x, y = x.to(device), y.to(device)
+                    
+                    # Mixup
+                    if mixup_alpha > 0.0:
+                        x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha)
+                    else:
+                        y_a, y_b, lam = y, None, 1.0
+                    
+                    # Replay samples
+                    if use_replay and replay_buf and len(replay_buf) > 0:
+                        replay_size = max(1, int(x.size(0) * replay_fraction))
+                        x_mem, y_mem = replay_buf.sample(replay_size)
+                        if x_mem is not None:
+                            x_mem, y_mem = x_mem.to(device), y_mem.to(device)
+                            x = torch.cat([x, x_mem], dim=0)
+                            y_a = torch.cat([y_a, y_mem], dim=0)
+                            if y_b is not None:
+                                y_b = torch.cat([y_b, y_mem], dim=0)
+                    
+                    # ER: Mix current batch with replay
+                    if method == 'er' and replay_buf and len(replay_buf) > 0:
+                        replay_size = x.size(0) // 2
+                        x_mem, y_mem = replay_buf.sample(replay_size)
+                        if x_mem is not None:
+                            x_mem, y_mem = x_mem.to(device), y_mem.to(device)
+                            x = torch.cat([x, x_mem], dim=0)
+                            y_a = torch.cat([y_a, y_mem], dim=0)
+                    
+                    # A-GEM: Store gradients from memory
+                    if method == 'agem' and agem_buffer and len(agem_buffer) > 0 and t > 0:
+                        # Compute gradient on memory
+                        model.zero_grad()
+                        x_mem, y_mem = agem_buffer.sample(agem_sample_size)
+                        if x_mem is not None:
+                            x_mem, y_mem = x_mem.to(device), y_mem.to(device)
+                            out_mem = model(x_mem)
+                            loss_mem = loss_fn(out_mem, y_mem)
+                            loss_mem.backward()
+                            memory_grads = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in model.parameters()]
+                    
+                    opt.zero_grad()
+                    out = model(x)
+                    
+                    # Task loss
+                    loss = mixup_criterion(loss_fn, out, y_a, y_b, lam)
+                    
+                    # LwF distillation
+                    if (use_lwf or method == 'lwf') and prev_model is not None:
+                        with torch.no_grad():
+                            old_out = prev_model(x)
+                        distill_loss = F.kl_div(
+                            F.log_softmax(out / distill_temperature, dim=1),
+                            F.softmax(old_out / distill_temperature, dim=1),
+                            reduction='batchmean'
+                        ) * (distill_temperature ** 2)
+                        loss = (1 - distill_alpha) * loss + distill_alpha * distill_loss
+                    
+                    # EWC penalty
+                    if (method == 'ewc' or use_ewc_in_hybrid) and t > 0 and len(fisher_sum) > 0:
+                        ewc_loss = 0.0
+                        for n, p in model.named_parameters():
+                            if n in fisher_sum and n in prev_params:
+                                ewc_loss += (fisher_sum[n].to(device) * (p - prev_params[n].to(device)) ** 2).sum()
+                        loss = loss + lambda_ewc * ewc_loss
+                    
+                    # DER++
+                    if method == 'der' and der_buffer and len(der_buffer.examples) > 0:
+                        x_mem, y_mem, logits_mem = der_buffer.sample(x.size(0) // 2)
+                        if x_mem is not None:
+                            x_mem = x_mem.to(device)
+                            y_mem = y_mem.to(device)
+                            logits_mem = logits_mem.to(device)
+                            
+                            out_mem = model(x_mem)
+                            loss_mem = loss_fn(out_mem, y_mem)
+                            loss_distill = F.mse_loss(out_mem, logits_mem)
+                            loss = loss + der_alpha * loss_mem + der_beta * loss_distill
+                    
+                    loss.backward()
+                    
+                    # A-GEM: Project gradients
+                    if method == 'agem' and t > 0 and agem_buffer and len(agem_buffer) > 0:
+                        if 'memory_grads' in locals():
+                            current_grads = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in model.parameters()]
+                            projected_grads = agem_project_gradient(current_grads, memory_grads)
+                            for p, proj_g in zip(model.parameters(), projected_grads):
+                                if p.grad is not None:
+                                    p.grad.copy_(proj_g)
+                    
+                    opt.step()
+                    
+                    # HOPE update
+                    if method == 'hope':
+                        hope_apply_batch_update(hope_target_modules, hope_forward_inputs, hope_backward_grads, 
+                                              eta=hope_eta, normalize_inputs=hope_normalize)
+                    
+                    # PackNet: Apply mask after update
+                    if method == 'packnet' and len(packnet_masks) > 0:
+                        packnet_apply_mask(model, packnet_masks)
+                    
+                    train_loss += loss.item()
+                
+                if scheduler:
+                    scheduler.step()
+            
+            epoch_times.append(time.time() - epoch_start)
+            print(f"  Epoch {epoch+1}/{epochs} - Loss: {train_loss/len(train_loader):.4f}")
+        
+        # Post-task operations
+        if method != 'prognn':
+            # Store examples in replay buffer
+            if (method in ['er', 'hybrid', 'icarl', 'mir', 'scr', 'gdumb'] or use_replay) and replay_buf is not None:
+                for x, y in train_loader:
+                    replay_buf.add_examples(x.cpu(), y.cpu())
+            
+            # A-GEM buffer
+            if method == 'agem' and agem_buffer is not None:
+                for x, y in train_loader:
+                    agem_buffer.add_examples(x.cpu(), y.cpu())
+            
+            # DER++ buffer
+            if method == 'der' and der_buffer is not None:
+                model.eval()
+                with torch.no_grad():
+                    for x, y in train_loader:
+                        x, y = x.to(device), y.to(device)
+                        logits = model(x)
+                        der_buffer.add_data(x, y, logits)
+            
+            # Update EWC Fisher information
+            if method == 'ewc' or use_ewc_in_hybrid:
+                new_fisher = fisher_information(model, train_loader, device, max_batches=100)
+                if len(fisher_sum) == 0:
+                    fisher_sum = new_fisher
+                else:
+                    for n in fisher_sum:
+                        if n in new_fisher:
+                            fisher_sum[n] = fisher_sum[n] + new_fisher[n]
+                
+                prev_params = {n: p.data.clone().cpu() for n, p in model.named_parameters()}
+            
+            # Update LwF previous model
+            if use_lwf or method == 'lwf':
+                prev_model = copy.deepcopy(model)
                 prev_model.eval()
-                for p in prev_model.parameters():
-                    p.requires_grad = False
-            except Exception:
-                prev_model = None
-
+            
+            # VCRR reconfiguration
+            if method.startswith('vcrr'):
+                vcrr_reconfigure_all_linears(model, k=vcrr_k, soft_alpha=vcrr_soft_alpha, 
+                                            randomized=randomized_svd, skip_output_linear=vcrr_skip_output,
+                                            num_classes=total_classes)
+            
+            # PackNet: Retrain with mask
+            if method == 'packnet' and t < num_tasks - 1:
+                for retrain_epoch in range(packnet_retrain_epochs):
+                    model.train()
+                    for x, y in train_loader:
+                        x, y = x.to(device), y.to(device)
+                        opt.zero_grad()
+                        out = model(x)
+                        loss = loss_fn(out, y)
+                        loss.backward()
+                        opt.step()
+                        packnet_apply_mask(model, packnet_masks)
+        
         tasks_seen += 1
+        
+        # Evaluate on all tasks seen so far
         accs = []
-        for i, (_, test_loader_i, cls_i) in enumerate(tasks[:t+1]):
-            acc = compute_accuracy(model, test_loader_i, device)
+        for eval_t in range(tasks_seen):
+            _, eval_loader, _ = tasks[eval_t]
+            
+            if method == 'prognn':
+                # Use last column for evaluation
+                current_column = prognn_columns[-1]
+                current_column.eval()
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    for x, y in eval_loader:
+                        x, y = x.to(device), y.to(device)
+                        
+                        lateral_inputs = [[] for _ in range(len(prognn_hidden_sizes))]
+                        if len(prognn_columns) > 1:
+                            for prev_col in prognn_columns[:-1]:
+                                _, prev_activations = prev_col(x, None)
+                                for layer_idx in range(len(prognn_hidden_sizes)):
+                                    if layer_idx < len(prev_activations):
+                                        lateral_inputs[layer_idx].append(prev_activations[layer_idx])
+                        
+                        out, _ = current_column(x, lateral_inputs)
+                        preds = out.argmax(dim=1)
+                        correct += (preds == y).sum().item()
+                        total += y.size(0)
+                acc = 100.0 * correct / total if total > 0 else 0.0
+            else:
+                acc = compute_accuracy(model, eval_loader, device)
+            
             accs.append(acc)
+            print(f"  Task {eval_t+1} accuracy: {acc:.2f}%")
+        
         acc_matrix.append(accs)
-        with open(os.path.join(out_dir, f"metrics_task{t}.json"), 'w') as f:
-            json.dump({'task': t, 'accs': accs}, f)
-
-    # final artifacts & run_info
-    metrics_all = {
-        'acc_matrix': acc_matrix,
-        'num_tasks': num_tasks,
-        'classes_per_task': classes_per_task
-    }
-    with open(os.path.join(out_dir, "metrics_all.json"), 'w') as f:
-        json.dump(metrics_all, f)
-
-    # compute forgetting robustly
-    runF = float('nan')
-    initial_acc_t1 = float('nan'); final_acc_t1 = float('nan')
-    if len(acc_matrix) >= 1:
-        try:
-            initial_acc_t1 = float(acc_matrix[0][0]) if len(acc_matrix[0])>0 else float('nan')
-            final_acc_t1 = float(acc_matrix[-1][0]) if len(acc_matrix[-1])>0 else float('nan')
-            if not (np.isnan(initial_acc_t1) or np.isnan(final_acc_t1)):
-                runF = initial_acc_t1 - final_acc_t1
-        except Exception:
-            runF = float('nan')
-
-    avg_acc = float(np.mean([row[-1] if len(row)>0 else np.nan for row in acc_matrix])) if len(acc_matrix)>0 else float('nan')
+        
+        # Calculate average accuracy and forgetting
+        avg_acc = np.mean(accs)
+        if tasks_seen > 1:
+            forgetting = 0.0
+            for i in range(tasks_seen - 1):
+                max_acc = max([acc_matrix[j][i] for j in range(i, tasks_seen)])
+                forgetting += max_acc - accs[i]
+            forgetting /= (tasks_seen - 1)
+        else:
+            forgetting = 0.0
+        
+        print(f"  Average accuracy: {avg_acc:.2f}%")
+        print(f"  Forgetting: {forgetting:.2f}%")
+    
+    # Final metrics
     total_time = time.time() - t0
     peak_mem_mb = maybe_get_cuda_peak_mb(device)
-
-    run_info = {
-        'F': runF,
-        'initial_acc_task1': (initial_acc_t1 if not np.isnan(initial_acc_t1) else None),
-        'final_acc_task1': (final_acc_t1 if not np.isnan(final_acc_t1) else None),
-        'avg_acc': avg_acc,
-        'time_s': total_time,
-        'params': n_params,
-        'epoch_times': epoch_times,
-        'peak_mem_mb': peak_mem_mb,
-        'expected_steps': expected_steps,
+    
+    final_avg_acc = np.mean(acc_matrix[-1])
+    final_forgetting = 0.0
+    if num_tasks > 1:
+        for i in range(num_tasks - 1):
+            max_acc = max([acc_matrix[j][i] for j in range(i, num_tasks)])
+            final_forgetting += max_acc - acc_matrix[-1][i]
+        final_forgetting /= (num_tasks - 1)
+    
+    # Backward transfer (improvement on past tasks)
+    backward_transfer = 0.0
+    if num_tasks > 1:
+        for i in range(num_tasks - 1):
+            backward_transfer += acc_matrix[-1][i] - acc_matrix[i][i]
+        backward_transfer /= (num_tasks - 1)
+    
+    results = {
         'method': method,
-        'cfg': cfg
+        'seed': seed,
+        'dataset': dataset_name,
+        'num_tasks': num_tasks,
+        'final_avg_acc': final_avg_acc,
+        'final_forgetting': final_forgetting,
+        'backward_transfer': backward_transfer,
+        'accuracy_matrix': acc_matrix,
+        'total_time_sec': total_time,
+        'peak_memory_mb': peak_mem_mb,
+        'config': cfg
     }
-    with open(os.path.join(out_dir, "run_info.json"), 'w') as f:
-        json.dump(run_info, f)
+    
+    if method != 'prognn':
+        results['num_params'] = n_params
+    
+    # Save results
+    result_path = os.path.join(out_dir, f"{method}_seed{seed}_results.json")
+    with open(result_path, 'w') as f:
+        json.dump(results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
+    
+    print(f"\n=== Final Results ({method}) ===")
+    print(f"Average Accuracy: {final_avg_acc:.2f}%")
+    print(f"Forgetting: {final_forgetting:.2f}%")
+    print(f"Backward Transfer: {backward_transfer:.2f}%")
+    print(f"Total Time: {total_time:.2f}s")
+    print(f"Peak Memory: {peak_mem_mb:.2f} MB")
+    
+    # Cleanup hooks
+    if method != 'prognn':
+        for hook in hope_hooks:
+            hook.remove()
+    
+    return results
 
-    os.makedirs('results', exist_ok=True)
-    summary_csv = os.path.join('results','summary_all.csv')
-    if not os.path.exists(summary_csv):
-        with open(summary_csv,'w') as fh:
-            fh.write("run,F,initial_acc_task1,final_acc_task1,avg_acc,time_s\n")
-    with open(summary_csv,'a') as fh:
-        fh.write(f"{os.path.basename(out_dir)},{str(runF)},{str(run_info.get('initial_acc_task1'))},{str(run_info.get('final_acc_task1'))},{avg_acc:.4f},{total_time:.2f}\n")
 
-    print(f"Wrote {out_dir} F={runF} initial_acc_t1={run_info.get('initial_acc_task1')} final_acc_t1={run_info.get('final_acc_task1')} avg_acc={avg_acc:.4f} time_s={total_time:.2f} params={n_params} peak_mem_mb={peak_mem_mb:.1f}")
-
-# CLI
+# ---------- Main entry point ----------
 if __name__ == "__main__":
-    import yaml, argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', '-c', required=True)
-    parser.add_argument('--method', default='vcrr')
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--out', default='results/run')
-    parser.add_argument('--total_classes', type=int, default=100)
-    parser.add_argument('--deterministic', action='store_true')
+    parser = argparse.ArgumentParser(description='Continual Learning Experiments')
+    parser.add_argument('--config', type=str, default='configs/vcrr_exp1.json', help='Path to config file')
+    parser.add_argument('--method', type=str, default=None, help='Method to run (overrides config)')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument('--dataset', type=str, default=None, help='Dataset name (overrides config)')
+    parser.add_argument('--num_tasks', type=int, default=None, help='Number of tasks (overrides config)')
+    parser.add_argument('--output_dir', type=str, default='results', help='Output directory')
+    parser.add_argument('--deterministic', action='store_true', help='Use deterministic mode')
+    
     args = parser.parse_args()
-    cfg = yaml.safe_load(open(args.config,'r'))
-    run_experiment(cfg, method=args.method, seed=args.seed, out_dir=args.out, total_classes=args.total_classes, deterministic=args.deterministic)
+    
+    # Load config
+    if os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            cfg = json.load(f)
+    else:
+        print(f"Config file not found: {args.config}")
+        print("Using default configuration")
+        cfg = {
+            'dataset': {'name': 'cifar100', 'num_tasks': 5, 'classes_per_task': 20},
+            'training': {'batch_size': 128, 'epochs_per_task': 1, 'lr': 0.01, 'model': 'smallcnn'},
+            'vcrr': {'reconfig_k': 8, 'soft_alpha': 0.0, 'skip_output_linear': True}
+        }
+    
+    # Override with command line args
+    if args.method:
+        cfg['method'] = args.method
+    if args.dataset:
+        if 'dataset' not in cfg:
+            cfg['dataset'] = {}
+        cfg['dataset']['name'] = args.dataset
+    if args.num_tasks:
+        if 'dataset' not in cfg:
+            cfg['dataset'] = {}
+        cfg['dataset']['num_tasks'] = args.num_tasks
+    
+    method = cfg.get('method', 'vcrr_exp1')
+    
+    # Determine total classes based on dataset
+    dataset_name = cfg.get('dataset', {}).get('name', 'cifar100').lower()
+    if dataset_name == 'cifar100':
+        total_classes = 100
+    elif dataset_name == 'cifar10':
+        total_classes = 10
+    elif dataset_name in ['permuted_mnist', 'permutedmnist']:
+        total_classes = 10
+    elif dataset_name in ['tinyimagenet', 'tiny_imagenet']:
+        total_classes = 200
+    elif dataset_name == 'core50':
+        total_classes = 50
+    else:
+        total_classes = 100
+    
+    # Create output directory
+    out_dir = os.path.join(args.output_dir, f"{method}_{dataset_name}_seed{args.seed}")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    print(f"Running experiment: {method}")
+    print(f"Dataset: {dataset_name}")
+    print(f"Seed: {args.seed}")
+    print(f"Output: {out_dir}")
+    
+    # Run experiment
+    results = run_experiment(
+        cfg=cfg,
+        method=method,
+        seed=args.seed,
+        out_dir=out_dir,
+        total_classes=total_classes,
+        deterministic=args.deterministic
+    )
+    
+    print(f"\nResults saved to: {out_dir}")

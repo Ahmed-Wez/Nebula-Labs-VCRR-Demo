@@ -1,0 +1,19 @@
+dataset:
+  name: permuted_mnist
+  num_tasks: 10
+  classes_per_task: 10
+
+training:
+  model: mlp
+  epochs_per_task: 5
+  batch_size: 128
+  lr: 0.01
+  optimizer: sgd
+  momentum: 0.9
+  weight_decay: 0.0
+  augment: false
+
+method: prognn
+
+prognn:
+  hidden_sizes: [256, 256]

@@ -1,0 +1,23 @@
+dataset:
+  name: tinyimagenet
+  num_tasks: 20
+  classes_per_task: 10
+
+training:
+  model: resnet18
+  epochs_per_task: 10
+  batch_size: 64
+  lr: 0.01
+  optimizer: sgd
+  momentum: 0.9
+  weight_decay: 5e-4
+  augment: true
+
+method: vcrr_exp1
+
+vcrr:
+  reconfig_k: 64
+  soft_alpha: 0.0
+  apply_to: all_linear
+  randomized_svd: false
+  skip_output_linear: true

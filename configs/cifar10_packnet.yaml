@@ -1,0 +1,20 @@
+dataset:
+  name: cifar10
+  num_tasks: 5
+  classes_per_task: 2
+
+training:
+  model: smallcnn
+  epochs_per_task: 10
+  batch_size: 128
+  lr: 0.01
+  optimizer: sgd
+  momentum: 0.9
+  weight_decay: 5e-4
+  augment: true
+
+method: packnet
+
+packnet:
+  prune_percentage: 0.5
+  retrain_epochs: 5

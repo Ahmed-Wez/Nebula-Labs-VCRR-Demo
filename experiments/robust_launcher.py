@@ -1,4 +1,4 @@
-import os, sys, subprocess
+import os, sys, subprocess, json
 from pathlib import Path
 
 REPO = Path.cwd() / "Nebula-Labs-VCRR-Demo"
@@ -14,87 +14,127 @@ env["PYTHONPATH"] = f"{str(SRC)}:{env.get('PYTHONPATH','')}"
 env["OMP_NUM_THREADS"] = "1"
 env["MKL_NUM_THREADS"] = "1"
 
-MODE = os.environ.get("MODE", "max_quality")
-DEFAULT_CONFIG_CANDIDATES = []
-if MODE == "max_quality":
-    DEFAULT_CONFIG_CANDIDATES = ["configs/parity_final_long.yaml", "configs/parity_boosted.yaml", "configs/parity_tuned_vcrr_exp1.yaml"]
-else:
-    DEFAULT_CONFIG_CANDIDATES = ["configs/parity_final_robust.yaml", "configs/parity_boosted.yaml", "configs/parity_tuned_vcrr_exp1.yaml"]
-
-# Seeds
+# Configuration
+DATASET = os.environ.get("DATASET", "cifar100")  # cifar10, cifar100, permuted_mnist, tinyimagenet, core50
 N_SEEDS = int(os.environ.get("N_SEEDS", "10"))
 SEEDS = list(range(N_SEEDS))
 
+# Method mapping
 METHOD_ARG = {
-    "vcrr": "vcrr",
+    "baseline": "baseline",
     "ewc": "ewc",
+    "lwf": "lwf",
+    "er": "er",
+    "agem": "agem",
+    "der": "der",
+    "packnet": "packnet",
+    "prognn": "prognn",
     "hope": "hope",
-    "gdumb": "hybrid",
-    "icarl": "hybrid",
-    "mir": "hybrid",
-    "scr": "hybrid"
+    "icarl": "icarl",
+    "gdumb": "gdumb",
+    "mir": "mir",
+    "scr": "scr",
+    "vcrr": "vcrr_exp1"
 }
 
-RUN_ORDER = ["vcrr", "ewc", "hope", "gdumb", "icarl", "mir", "scr"]
+# Run all methods for the specified dataset
+RUN_ORDER = list(METHOD_ARG.keys())
 
-def choose_config_for(label):
-    candidates = []
-    candidates += [f"configs/parity_final_{label}.yaml", f"configs/parity_final_{label}.yml"]
-    candidates += [f"configs/parity_tuned_{label}.yaml", f"configs/parity_boosted_{label}.yaml"]
-    if label == "vcrr":
-        candidates += [f"configs/parity_tuned_vcrr_exp1.yaml", f"configs/parity_tuned_vcrr_exp2.yaml", "configs/parity_boosted.yaml"]
-    candidates += DEFAULT_CONFIG_CANDIDATES
+def find_config(dataset, method):
+    """Find config file for dataset + method combination"""
+    candidates = [
+        CFG_DIR / f"{dataset}_{method}.yaml",
+        CFG_DIR / f"{dataset}_{method}.yml",
+    ]
+    
+    # Special case for VCRR on CIFAR-100
+    if method == "vcrr" and dataset == "cifar100":
+        candidates.insert(0, CFG_DIR / "parity_tuned_vcrr_exp1.yaml")
+        candidates.insert(1, CFG_DIR / "parity_boosted_vcrr.yaml")
+    
     for c in candidates:
-        p = REPO / c
-        if p.exists():
-            return p
+        if c.exists():
+            return c
     return None
 
-print(f"Launcher MODE={MODE} N_SEEDS={N_SEEDS} - using REPO={REPO}")
+print(f"╔════════════════════════════════════════════════════╗")
+print(f"║     ROBUST LAUNCHER - {DATASET.upper():^30} ║")
+print(f"╚════════════════════════════════════════════════════╝")
+print(f"Seeds: {N_SEEDS}")
+print(f"Methods: {len(RUN_ORDER)}\n")
+
+successful = 0
+failed = 0
+skipped = 0
+
 for label in RUN_ORDER:
     method_arg = METHOD_ARG.get(label)
     if method_arg is None:
-        print(f"[SKIP] unknown method mapping for {label}")
+        print(f"[SKIP] {label} - unknown method")
         continue
-    cfg_path = choose_config_for(label)
+    
+    cfg_path = find_config(DATASET, label)
     if cfg_path is None:
-        print(f"[SKIP] {label} -> no config found (looked at candidates).")
+        print(f"[SKIP] {label} - no config found for {DATASET}")
+        skipped += 1
         continue
-    print(f"\n=== Launching label={label} using config={cfg_path} (method arg={method_arg}) ===")
+    
+    print(f"\n{'='*60}")
+    print(f"METHOD: {label} ({method_arg})")
+    print(f"CONFIG: {cfg_path.name}")
+    print(f"{'='*60}")
+    
     for seed in SEEDS:
-        outdir = RESULTS_DIR / f"{label}_seed{seed}"
+        outdir = RESULTS_DIR / f"{DATASET}_{label}_seed{seed}"
         outdir.mkdir(parents=True, exist_ok=True)
-        if (outdir / "metrics_all.json").exists() or (outdir / "run_info.json").exists():
-            print(f"[SKIP] {outdir} exists (already finished)")
+        
+        if (outdir / "metrics_all.json").exists():
+            print(f"  [SKIP] seed {seed} - already finished")
+            skipped += 1
             continue
-        print(f">>> RUN {label} seed={seed} -> {outdir}")
-        cmd = [sys.executable, str(SRC / "train.py"),
-               "--config", str(cfg_path),
-               "--method", method_arg,
-               "--seed", str(seed),
-               "--out", str(outdir)]
+        
+        print(f"  [RUN] seed {seed}...")
+        
+        cmd = [
+            sys.executable, str(SRC / "train.py"),
+            "--config", str(cfg_path),
+            "--method", method_arg,
+            "--seed", str(seed),
+            "--output_dir", str(outdir)
+        ]
+        
         try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True)
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                timeout=7200
+            )
+            
             (outdir / "run.log").write_text(proc.stdout or "")
-            lines = (proc.stdout or "").splitlines()
-            if lines:
-                head = "\n".join(lines[:10])
-                tail = "\n".join(lines[-5:]) if len(lines) > 10 else ""
-                print("----- run.log preview (head) -----")
-                print(head)
-                if tail:
-                    print("----- run.log preview (tail) -----")
-                    print(tail)
-            else:
-                print("[no stdout captured]")
+            
             if proc.returncode != 0:
-                print(f"[ERROR] {label} seed {seed} failed (rc={proc.returncode}) — see {outdir/'run.log'}")
+                print(f"    [ERROR] rc={proc.returncode}")
+                failed += 1
             else:
-                print(f"[DONE] {label} seed {seed}")
+                print(f"    [DONE]")
+                successful += 1
+                
+        except subprocess.TimeoutExpired:
+            print(f"    [TIMEOUT]")
+            (outdir / "run.log").write_text("TIMEOUT\n")
+            failed += 1
         except Exception as e:
-            err = f"[EXCEPTION] while running {label} seed {seed}: {e}"
-            print(err)
-            (outdir / "run.log").write_text(err + "\n")
-        print("----")
+            print(f"    [EXCEPTION] {e}")
+            (outdir / "run.log").write_text(f"EXCEPTION: {e}\n")
+            failed += 1
 
-print("\nAll requested experiments attempted. Inspect results/*_seed*/run.log, run_info.json and metrics_all.json for details.")
+print(f"\n{'='*60}")
+print(f"SUMMARY")
+print(f"{'='*60}")
+print(f"Successful: {successful}")
+print(f"Failed: {failed}")
+print(f"Skipped: {skipped}")
+print(f"\nTo run different dataset: DATASET=cifar10 python experiments/robust_launcher.py")

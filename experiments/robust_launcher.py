@@ -42,19 +42,11 @@ RUN_ORDER = list(METHOD_ARG.keys())
 
 def find_config(dataset, method):
     """Find config file for dataset + method combination"""
-    candidates = [
-        CFG_DIR / f"{dataset}_{method}.yaml",
-        CFG_DIR / f"{dataset}_{method}.yml",
-    ]
+    # Standard naming: {dataset}_{method}.yaml
+    cfg_path = CFG_DIR / f"{dataset}_{method}.yaml"
     
-    # Special case for VCRR on CIFAR-100
-    if method == "vcrr" and dataset == "cifar100":
-        candidates.insert(0, CFG_DIR / "parity_tuned_vcrr_exp1.yaml")
-        candidates.insert(1, CFG_DIR / "parity_boosted_vcrr.yaml")
-    
-    for c in candidates:
-        if c.exists():
-            return c
+    if cfg_path.exists():
+        return cfg_path
     return None
 
 print(f"╔════════════════════════════════════════════════════╗")
@@ -137,4 +129,6 @@ print(f"{'='*60}")
 print(f"Successful: {successful}")
 print(f"Failed: {failed}")
 print(f"Skipped: {skipped}")
-print(f"\nTo run different dataset: DATASET=cifar10 python experiments/robust_launcher.py")
+print(f"\nTo run different dataset:")
+print(f"  DATASET=cifar10 python experiments/robust_launcher.py")
+print(f"  DATASET=permuted_mnist python experiments/robust_launcher.py")

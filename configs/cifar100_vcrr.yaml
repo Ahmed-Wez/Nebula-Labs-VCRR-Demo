@@ -1,0 +1,29 @@
+dataset:
+  name: cifar100
+  num_tasks: 5  # MUST match baselines!
+  classes_per_task: 20
+
+training:
+  model: resnet34
+  epochs_per_task: 16
+  batch_size: 128
+  lr: 0.01
+  optimizer: sgd
+  momentum: 0.9
+  weight_decay: 5e-4
+  augment: true
+  mixup_alpha: 0.1  # MUST match baselines!
+  label_smoothing: 0.0  # Remove advantage
+  set_cudnn_benchmark: true
+  scheduler:
+    step_size: 4
+    gamma: 0.5
+
+method: vcrr_exp1
+
+vcrr:
+  reconfig_k: 64
+  soft_alpha: 0.0
+  apply_to: all_linear
+  randomized_svd: false
+  skip_output_linear: true

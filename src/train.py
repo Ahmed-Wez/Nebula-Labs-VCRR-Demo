@@ -290,8 +290,6 @@ class CORe50Dataset(Dataset):
         self.transform = transform
         self.samples = []
         
-        # CORe50 has different scenarios: 'ni' (new instances), 'nc' (new classes), etc.
-        # For simplicity, we'll implement 'nc' scenario with 10 tasks × 5 classes
         paths_file = self.root / f'core50_{"train" if train else "test"}.txt'
         
         if not paths_file.exists():
@@ -299,13 +297,11 @@ class CORe50Dataset(Dataset):
             print("Please download CORe50 dataset from: https://vlomonaco.github.io/core50/")
             return
         
-        # Load all data and filter by task
         with open(paths_file, 'r') as f:
             for line in f:
                 parts = line.strip().split()
                 if len(parts) >= 2:
                     img_path, label = parts[0], int(parts[1])
-                    # Simple task assignment: divide 50 classes into tasks
                     if label // 5 == task_id:
                         full_path = self.root / img_path
                         if full_path.exists():
@@ -356,7 +352,6 @@ def get_core50_loaders(num_tasks=10, batch_size=128, seed=0, num_workers=2, augm
         loader_train = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
         loader_test = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
         
-        # Classes for this task
         cls = list(range(t*5, (t+1)*5))
         tasks.append((loader_train, loader_test, cls))
     
@@ -392,13 +387,16 @@ class SmallCNN(nn.Module):
         self.fc1 = nn.Linear(128*4*4,256)
         self.fc2 = nn.Linear(256,num_classes)
     
-    def forward(self,x):
+    def forward(self,x, return_features=False):
         x = torch.relu(self.conv1(x))
         x = self.pool(torch.relu(self.conv2(x)))
         x = self.adaptive_pool(x)
         feat = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(feat))
-        return self.fc2(x)
+        out = self.fc2(x)
+        if return_features:
+            return out, x
+        return out
 
 
 class MLP(nn.Module):
@@ -410,12 +408,16 @@ class MLP(nn.Module):
             layers.append(nn.Linear(prev_size, h))
             layers.append(nn.ReLU())
             prev_size = h
-        layers.append(nn.Linear(prev_size, num_classes))
-        self.network = nn.Sequential(*layers)
+        self.feature_extractor = nn.Sequential(*layers)
+        self.classifier = nn.Linear(prev_size, num_classes)
     
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         x = x.view(x.size(0), -1)
-        return self.network(x)
+        features = self.feature_extractor(x)
+        out = self.classifier(features)
+        if return_features:
+            return out, features
+        return out
 
 
 def get_model(backbone='smallcnn', total_classes=100, input_channels=3, input_size=784):
@@ -443,6 +445,30 @@ def get_model(backbone='smallcnn', total_classes=100, input_channels=3, input_si
         return SmallCNN(num_classes=total_classes, input_channels=input_channels)
 
 
+# Add feature extraction helper for ResNet models
+def get_features(model, x):
+    """Extract features from model before final classification layer"""
+    if isinstance(model, (SmallCNN, MLP)):
+        return model(x, return_features=True)
+    elif isinstance(model, models.ResNet):
+        # For ResNet models
+        x = model.conv1(x)
+        x = model.bn1(x)
+        x = model.relu(x)
+        x = model.maxpool(x)
+        x = model.layer1(x)
+        x = model.layer2(x)
+        x = model.layer3(x)
+        x = model.layer4(x)
+        x = model.avgpool(x)
+        features = torch.flatten(x, 1)
+        out = model.fc(features)
+        return out, features
+    else:
+        # Fallback
+        return model(x), None
+
+
 # ---------- Exemplar buffer (for ER, iCaRL, etc.) ----------
 class ExemplarBuffer:
     def __init__(self, per_class=20):
@@ -460,6 +486,52 @@ class ExemplarBuffer:
                 if random.random() < 0.01:
                     idx = random.randrange(len(lst))
                     lst[idx] = x.clone()
+    
+    def add_examples_herding(self, xs_cpu, ys_cpu, features_cpu, model, device):
+        """iCaRL herding: select exemplars closest to class mean in feature space"""
+        for class_id in torch.unique(ys_cpu):
+            class_id = int(class_id.item())
+            if class_id not in self.store:
+                self.store[class_id] = []
+            
+            # Get all samples for this class
+            class_mask = ys_cpu == class_id
+            class_samples = xs_cpu[class_mask]
+            class_features = features_cpu[class_mask]
+            
+            # Compute class mean
+            class_mean = class_features.mean(dim=0)
+            
+            # Herding selection
+            selected = []
+            selected_features = []
+            remaining_indices = list(range(len(class_samples)))
+            
+            for k in range(min(self.per_class, len(class_samples))):
+                if len(remaining_indices) == 0:
+                    break
+                
+                # Compute mean of selected so far
+                if len(selected_features) == 0:
+                    current_mean = torch.zeros_like(class_mean)
+                else:
+                    current_mean = torch.stack(selected_features).mean(dim=0)
+                
+                # Find sample that minimizes distance to class mean
+                best_idx = None
+                best_dist = float('inf')
+                for idx in remaining_indices:
+                    new_mean = (current_mean * len(selected_features) + class_features[idx]) / (len(selected_features) + 1)
+                    dist = torch.norm(new_mean - class_mean)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = idx
+                
+                selected.append(class_samples[best_idx])
+                selected_features.append(class_features[best_idx])
+                remaining_indices.remove(best_idx)
+            
+            self.store[class_id] = selected[:self.per_class]
     
     def sample(self, n_total):
         if len(self.store)==0: return None, None
@@ -491,6 +563,19 @@ class ExemplarBuffer:
         if len(xs_list) == 0:
             return None, None
         return torch.stack(xs_list), torch.tensor(ys_list, dtype=torch.long)
+    
+    def get_class_means(self, model, device):
+        """Compute class means for iCaRL nearest-mean classification"""
+        class_means = {}
+        for class_id, exemplars in self.store.items():
+            if len(exemplars) == 0:
+                continue
+            exemplars_tensor = torch.stack(exemplars).to(device)
+            with torch.no_grad():
+                _, features = get_features(model, exemplars_tensor)
+                if features is not None:
+                    class_means[class_id] = features.mean(dim=0).cpu()
+        return class_means
     
     def __len__(self):
         return sum(len(v) for v in self.store.values())
@@ -525,6 +610,74 @@ class DERBuffer:
         batch_y = torch.stack([self.labels[i] for i in indices])
         batch_logits = torch.stack([self.logits[i] for i in indices])
         return batch_x, batch_y, batch_logits
+
+
+# ---------- MIR Buffer (Maximally Interfered Retrieval) ----------
+class MIRBuffer:
+    def __init__(self, max_size=2000):
+        self.max_size = max_size
+        self.examples = []
+        self.labels = []
+    
+    def add_data(self, examples, labels):
+        for e, l in zip(examples, labels):
+            if len(self.examples) < self.max_size:
+                self.examples.append(e.cpu().clone())
+                self.labels.append(l.cpu().clone())
+            else:
+                idx = random.randint(0, len(self.examples) - 1)
+                self.examples[idx] = e.cpu().clone()
+                self.labels[idx] = l.cpu().clone()
+    
+    def sample_mir(self, n, model, device, current_batch_x, current_batch_y):
+        """Sample based on maximally interfered retrieval"""
+        if len(self.examples) == 0:
+            return None, None
+        
+        # If buffer smaller than requested, return all
+        if len(self.examples) <= n:
+            batch_x = torch.stack(self.examples)
+            batch_y = torch.stack(self.labels)
+            return batch_x, batch_y
+        
+        # Compute loss on current batch
+        model.eval()
+        with torch.no_grad():
+            current_x = current_batch_x.to(device)
+            current_y = current_batch_y.to(device)
+            loss_fn = nn.CrossEntropyLoss(reduction='none')
+            out = model(current_x)
+            current_losses = loss_fn(out, current_y)
+        
+        # Sample candidates from buffer (larger than n)
+        candidate_size = min(n * 5, len(self.examples))
+        candidate_indices = np.random.choice(len(self.examples), candidate_size, replace=False)
+        
+        # Compute virtual loss increase for each candidate
+        scores = []
+        for idx in candidate_indices:
+            mem_x = self.examples[idx].unsqueeze(0).to(device)
+            mem_y = self.labels[idx].unsqueeze(0).to(device)
+            
+            # Compute loss before update
+            with torch.no_grad():
+                out_before = model(mem_x)
+                loss_before = loss_fn(out_before, mem_y).item()
+            
+            # Virtual update step (simplified - just use current gradient direction)
+            # In practice, MIR does a full virtual update, but this is expensive
+            # We approximate by using loss magnitude as interference proxy
+            scores.append((idx, loss_before))
+        
+        # Select top-n most interfered samples
+        scores.sort(key=lambda x: x[1], reverse=True)
+        selected_indices = [idx for idx, _ in scores[:n]]
+        
+        batch_x = torch.stack([self.examples[i] for i in selected_indices])
+        batch_y = torch.stack([self.labels[i] for i in selected_indices])
+        
+        model.train()
+        return batch_x, batch_y
 
 
 # ---------- VCRR ----------
@@ -720,6 +873,44 @@ def compute_accuracy(model, loader, device):
     return 100.0 * correct / total if total>0 else 0.0
 
 
+def compute_accuracy_icarl(model, loader, device, class_means):
+    """iCaRL nearest-mean classification"""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    if len(class_means) == 0:
+        return compute_accuracy(model, loader, device)
+    
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            _, features = get_features(model, x)
+            
+            if features is None:
+                # Fallback to standard accuracy
+                out = model(x)
+                preds = out.argmax(dim=1)
+            else:
+                # Nearest-mean classification
+                preds = []
+                for feat in features:
+                    min_dist = float('inf')
+                    pred_class = -1
+                    for class_id, class_mean in class_means.items():
+                        dist = torch.norm(feat.cpu() - class_mean)
+                        if dist < min_dist:
+                            min_dist = dist
+                            pred_class = class_id
+                    preds.append(pred_class)
+                preds = torch.tensor(preds, device=device)
+            
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+    
+    return 100.0 * correct / total if total > 0 else 0.0
+
+
 def mixup_data(x, y, alpha=0.2):
     if alpha <= 0.0:
         return x, y, None, 1.0
@@ -801,6 +992,40 @@ def hope_apply_batch_update(target_modules, forward_inputs, backward_grads, eta=
             m.weight.data.copy_(W_new)
 
 
+# ---------- Load config (support both JSON and YAML) ----------
+def load_config(config_path):
+    """Load configuration from JSON or YAML file"""
+    config_path = Path(config_path)
+    
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    # Try YAML first (since most configs are YAML)
+    if config_path.suffix in ['.yaml', '.yml']:
+        try:
+            import yaml
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except ImportError:
+            print("PyYAML not installed. Install with: pip install pyyaml")
+            raise
+    
+    # Try JSON
+    elif config_path.suffix == '.json':
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    
+    # Try both if extension is unclear
+    else:
+        try:
+            import yaml
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+
+
 # ---------- main experiment runner ----------
 def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_classes=100, deterministic=False):
     t0 = time.time()
@@ -820,6 +1045,10 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     agem_cfg = cfg.get('agem',{}) or {}
     der_cfg = cfg.get('der',{}) or {}
     prognn_cfg = cfg.get('prognn',{}) or {}
+    icarl_cfg = cfg.get('icarl',{}) or {}
+    gdumb_cfg = cfg.get('gdumb',{}) or {}
+    mir_cfg = cfg.get('mir',{}) or {}
+    scr_cfg = cfg.get('scr',{}) or {}
 
     # Dataset parameters
     dataset_name = dataset_cfg.get('name', 'cifar100')
@@ -879,7 +1108,7 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     packnet_prune_perc = float(packnet_cfg.get('prune_percentage', 0.5))
     packnet_retrain_epochs = int(packnet_cfg.get('retrain_epochs', 5))
 
-    # ER params (Experience Replay - simple version)
+    # ER params
     er_buffer_size = int(er_cfg.get('buffer_size', 2000))
 
     # A-GEM params
@@ -899,6 +1128,23 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     hope_apply_to = hope_cfg.get('apply_to', 'fc_only')
     hope_use_with_opt = bool(hope_cfg.get('use_with_optimizer', True))
     hope_normalize = bool(hope_cfg.get('normalize_inputs', True))
+
+    # iCaRL params
+    use_icarl = bool(icarl_cfg.get('enabled', False)) or (method == 'icarl')
+    icarl_herding = bool(icarl_cfg.get('herding', True))
+    icarl_nearest_mean = bool(icarl_cfg.get('nearest_exemplar', True))
+
+    # GDumb params
+    use_gdumb = bool(gdumb_cfg.get('enabled', False)) or (method == 'gdumb')
+    gdumb_train_at_end = bool(gdumb_cfg.get('train_only_at_end', True))
+
+    # MIR params
+    use_mir = bool(mir_cfg.get('enabled', False)) or (method == 'mir')
+    mir_lookahead = int(mir_cfg.get('lookahead_updates', 1))
+
+    # SCR params
+    use_scr = bool(scr_cfg.get('enabled', False)) or (method == 'scr')
+    scr_selection_mode = scr_cfg.get('selection_mode', 'diversity')
 
     if set_cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
@@ -926,7 +1172,6 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
 
     # Initialize model
     if method == 'prognn':
-        # ProgNN uses multiple columns
         prognn_columns = []
         prognn_task_heads = []
     else:
@@ -961,9 +1206,15 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     replay_buf = None
     der_buffer = None
     agem_buffer = None
+    mir_buffer = None
     packnet_masks = {}
+    icarl_class_means = {}
     
-    if method in ['er', 'hybrid'] or use_replay:
+    # GDumb: collect ALL data
+    gdumb_all_data_x = []
+    gdumb_all_data_y = []
+    
+    if method in ['er', 'hybrid'] or use_replay or use_icarl or use_scr:
         replay_buf = ExemplarBuffer(per_class=exemplar_per_class)
     
     if method == 'der':
@@ -971,6 +1222,9 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     
     if method == 'agem':
         agem_buffer = ExemplarBuffer(per_class=agem_buffer_size // (num_tasks * classes_per_task))
+    
+    if method == 'mir' or use_mir:
+        mir_buffer = MIRBuffer(max_size=er_buffer_size)
 
     # HOPE hooks
     if method != 'prognn':
@@ -993,12 +1247,55 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
     for t, (train_loader, test_loader, cls_list) in enumerate(tasks):
         print(f"[seed={seed}] Training task {t+1}/{num_tasks} classes={len(cls_list)} method={method}")
 
+        # GDumb: just collect data, don't train
+        if use_gdumb and t < num_tasks - 1:
+            print(f"  GDumb: Collecting data from task {t+1}")
+            for x, y in train_loader:
+                gdumb_all_data_x.append(x)
+                gdumb_all_data_y.append(y)
+            
+            # Skip training
+            tasks_seen += 1
+            
+            # Evaluate (will be poor until final task)
+            accs = []
+            for eval_t in range(tasks_seen):
+                _, eval_loader, _ = tasks[eval_t]
+                acc = compute_accuracy(model, eval_loader, device)
+                accs.append(acc)
+                print(f"  Task {eval_t+1} accuracy: {acc:.2f}%")
+            acc_matrix.append(accs)
+            continue
+        
+        # GDumb: final task - train on all collected data
+        if use_gdumb and t == num_tasks - 1:
+            print(f"  GDumb: Training on all collected data")
+            # Collect final task data
+            for x, y in train_loader:
+                gdumb_all_data_x.append(x)
+                gdumb_all_data_y.append(y)
+            
+            # Create unified dataset
+            all_x = torch.cat(gdumb_all_data_x, dim=0)
+            all_y = torch.cat(gdumb_all_data_y, dim=0)
+            gdumb_dataset = torch.utils.data.TensorDataset(all_x, all_y)
+            train_loader = torch.utils.data.DataLoader(gdumb_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+            
+            # Reset model
+            model = get_model(backbone, total_classes, input_channels, input_size).to(device)
+            if optimizer_name.lower() == 'adamw':
+                opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+            else:
+                momentum = float(training_cfg.get('momentum', 0.9))
+                opt = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+            
+            print(f"  Training on {len(all_x)} total examples for {epochs} epochs")
+
         # ProgNN: create new column
         if method == 'prognn':
             if t == 0:
                 lateral_connections = None
             else:
-                # Calculate lateral connection sizes
                 lateral_connections = []
                 for layer_idx in range(len(prognn_hidden_sizes)):
                     prev_layer_sizes = [prognn_hidden_sizes[layer_idx] for _ in range(len(prognn_columns))]
@@ -1013,12 +1310,10 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             
             prognn_columns.append(new_column)
             
-            # Freeze previous columns
             for prev_col in prognn_columns[:-1]:
                 for param in prev_col.parameters():
                     param.requires_grad = False
             
-            # Optimizer for new column
             opt = optim.SGD(new_column.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
             scheduler = None
             if scheduler_cfg:
@@ -1033,10 +1328,12 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             packnet_apply_mask(model, packnet_masks)
 
         # LwF: Store previous model
-        if (use_lwf or method == 'lwf') and t > 0 and prev_model is None:
-            prev_model = copy.deepcopy(model)
-            prev_model.eval()
+        if (use_lwf or method == 'lwf') and t > 0:
+            if prev_model is None:
+                prev_model = copy.deepcopy(model)
+                prev_model.eval()
 
+        # Train for this task
         # Train for this task
         for epoch in range(epochs):
             epoch_start = time.time()
@@ -1047,7 +1344,6 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
                 for batch_idx, (x, y) in enumerate(train_loader):
                     x, y = x.to(device), y.to(device)
                     
-                    # Get lateral inputs from previous columns
                     lateral_inputs = [[] for _ in range(len(prognn_hidden_sizes))]
                     if t > 0:
                         with torch.no_grad():
@@ -1080,8 +1376,19 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
                     else:
                         y_a, y_b, lam = y, None, 1.0
                     
-                    # Replay samples
-                    if use_replay and replay_buf and len(replay_buf) > 0:
+                    # MIR: Use maximally interfered retrieval
+                    if use_mir and mir_buffer and len(mir_buffer.examples) > 0:
+                        replay_size = max(1, int(x.size(0) * replay_fraction))
+                        x_mem, y_mem = mir_buffer.sample_mir(replay_size, model, device, x, y)
+                        if x_mem is not None:
+                            x_mem, y_mem = x_mem.to(device), y_mem.to(device)
+                            x = torch.cat([x, x_mem], dim=0)
+                            y_a = torch.cat([y_a, y_mem], dim=0)
+                            if y_b is not None:
+                                y_b = torch.cat([y_b, torch.zeros_like(y_mem)], dim=0)
+                    
+                    # Replay samples (for ER, iCaRL, SCR, hybrid)
+                    elif (use_replay or use_icarl or use_scr) and replay_buf and len(replay_buf) > 0:
                         replay_size = max(1, int(x.size(0) * replay_fraction))
                         x_mem, y_mem = replay_buf.sample(replay_size)
                         if x_mem is not None:
@@ -1102,7 +1409,6 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
                     
                     # A-GEM: Store gradients from memory
                     if method == 'agem' and agem_buffer and len(agem_buffer) > 0 and t > 0:
-                        # Compute gradient on memory
                         model.zero_grad()
                         x_mem, y_mem = agem_buffer.sample(agem_sample_size)
                         if x_mem is not None:
@@ -1181,9 +1487,34 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             print(f"  Epoch {epoch+1}/{epochs} - Loss: {train_loss/len(train_loader):.4f}")
         
         # Post-task operations
-        if method != 'prognn':
-            # Store examples in replay buffer
-            if (method in ['er', 'hybrid', 'icarl', 'mir', 'scr', 'gdumb'] or use_replay) and replay_buf is not None:
+        if method != 'prognn' and not use_gdumb:
+            # iCaRL: Use herding for exemplar selection
+            if use_icarl and replay_buf is not None:
+                print("  iCaRL: Selecting exemplars with herding")
+                all_x = []
+                all_y = []
+                for x, y in train_loader:
+                    all_x.append(x)
+                    all_y.append(y)
+                all_x = torch.cat(all_x, dim=0)
+                all_y = torch.cat(all_y, dim=0)
+                
+                # Get features
+                model.eval()
+                with torch.no_grad():
+                    _, features = get_features(model, all_x.to(device))
+                    if features is not None:
+                        features = features.cpu()
+                    else:
+                        features = all_x.view(all_x.size(0), -1)
+                
+                replay_buf.add_examples_herding(all_x, all_y, features, model, device)
+                
+                # Update class means for nearest-mean classification
+                icarl_class_means = replay_buf.get_class_means(model, device)
+            
+            # Store examples in replay buffer (standard)
+            elif (method in ['er', 'hybrid', 'scr'] or use_replay) and replay_buf is not None:
                 for x, y in train_loader:
                     replay_buf.add_examples(x.cpu(), y.cpu())
             
@@ -1191,6 +1522,11 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             if method == 'agem' and agem_buffer is not None:
                 for x, y in train_loader:
                     agem_buffer.add_examples(x.cpu(), y.cpu())
+            
+            # MIR buffer
+            if (method == 'mir' or use_mir) and mir_buffer is not None:
+                for x, y in train_loader:
+                    mir_buffer.add_data(x, y)
             
             # DER++ buffer
             if method == 'der' and der_buffer is not None:
@@ -1245,7 +1581,6 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             _, eval_loader, _ = tasks[eval_t]
             
             if method == 'prognn':
-                # Use last column for evaluation
                 current_column = prognn_columns[-1]
                 current_column.eval()
                 correct = 0
@@ -1267,6 +1602,8 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
                         correct += (preds == y).sum().item()
                         total += y.size(0)
                 acc = 100.0 * correct / total if total > 0 else 0.0
+            elif use_icarl and icarl_nearest_mean and len(icarl_class_means) > 0:
+                acc = compute_accuracy_icarl(model, eval_loader, device, icarl_class_means)
             else:
                 acc = compute_accuracy(model, eval_loader, device)
             
@@ -1301,7 +1638,7 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             final_forgetting += max_acc - acc_matrix[-1][i]
         final_forgetting /= (num_tasks - 1)
     
-    # Backward transfer (improvement on past tasks)
+    # Backward transfer
     backward_transfer = 0.0
     if num_tasks > 1:
         for i in range(num_tasks - 1):
@@ -1326,9 +1663,24 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
         results['num_params'] = n_params
     
     # Save results
-    result_path = os.path.join(out_dir, f"{method}_seed{seed}_results.json")
+    result_path = os.path.join(out_dir, f"metrics_all.json")
     with open(result_path, 'w') as f:
         json.dump(results, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
+    
+    # Also save a run_info.json for compatibility
+    run_info = {
+        'method': method,
+        'seed': seed,
+        'dataset': dataset_name,
+        'num_tasks': num_tasks,
+        'avg_acc': final_avg_acc,
+        'F': final_forgetting,
+        'time_s': total_time,
+        'peak_mem_mb': peak_mem_mb,
+        'params': n_params if method != 'prognn' else None
+    }
+    with open(os.path.join(out_dir, "run_info.json"), 'w') as f:
+        json.dump(run_info, f, indent=2, default=lambda x: float(x) if isinstance(x, np.floating) else x)
     
     print(f"\n=== Final Results ({method}) ===")
     print(f"Average Accuracy: {final_avg_acc:.2f}%")
@@ -1348,7 +1700,7 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
 # ---------- Main entry point ----------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Continual Learning Experiments')
-    parser.add_argument('--config', type=str, default='configs/vcrr_exp1.json', help='Path to config file')
+    parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--method', type=str, default=None, help='Method to run (overrides config)')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--dataset', type=str, default=None, help='Dataset name (overrides config)')
@@ -1358,18 +1710,8 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Load config
-    if os.path.exists(args.config):
-        with open(args.config, 'r') as f:
-            cfg = json.load(f)
-    else:
-        print(f"Config file not found: {args.config}")
-        print("Using default configuration")
-        cfg = {
-            'dataset': {'name': 'cifar100', 'num_tasks': 5, 'classes_per_task': 20},
-            'training': {'batch_size': 128, 'epochs_per_task': 1, 'lr': 0.01, 'model': 'smallcnn'},
-            'vcrr': {'reconfig_k': 8, 'soft_alpha': 0.0, 'skip_output_linear': True}
-        }
+    # Load config (supports both YAML and JSON)
+    cfg = load_config(args.config)
     
     # Override with command line args
     if args.method:

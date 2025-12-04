@@ -13,16 +13,10 @@ if not (SRC / "train.py").exists():
 N_SEEDS = 10
 SEEDS = list(range(N_SEEDS))
 
-# Define all benchmarks and their corresponding configs
-BENCHMARKS = {
-    'cifar10': ['cifar10'],
-    'cifar100': ['parity_boosted', 'parity_tuned_vcrr_exp1'],
-    'permuted_mnist': ['permuted_mnist'],
-    'tinyimagenet': ['tinyimagenet'],
-    'core50': ['core50']
-}
+# Define all datasets
+DATASETS = ['cifar10', 'cifar100', 'permuted_mnist', 'tinyimagenet', 'core50']
 
-# Define all methods and their method_arg mapping
+# Define all methods with their method_arg mapping
 METHODS = {
     'baseline': 'baseline',
     'ewc': 'ewc',
@@ -37,38 +31,23 @@ METHODS = {
     'gdumb': 'gdumb',
     'mir': 'mir',
     'scr': 'scr',
-    'vcrr_exp1': 'vcrr_exp1'
+    'vcrr': 'vcrr_exp1'
 }
 
 # Build complete run list
 runs = []
-
-# Add all benchmark + method combinations
-for dataset, cfg_prefixes in BENCHMARKS.items():
+for dataset in DATASETS:
     for method, method_arg in METHODS.items():
-        # Try to find config file
-        config_found = None
+        # Standard config naming: {dataset}_{method}.yaml
+        cfg_path = CFG_DIR / f"{dataset}_{method}.yaml"
         
-        # Special handling for VCRR experiments on cifar100
-        if method.startswith('vcrr_exp') and dataset == 'cifar100':
-            for prefix in cfg_prefixes:
-                if 'vcrr' in prefix:
-                    cfg_path = CFG_DIR / f"{prefix}.yaml"
-                    if cfg_path.exists():
-                        config_found = cfg_path
-                        break
-        else:
-            # Standard config search
-            cfg_path = CFG_DIR / f"{dataset}_{method}.yaml"
-            if cfg_path.exists():
-                config_found = cfg_path
-        
-        if config_found:
+        if cfg_path.exists():
             runs.append({
                 "label": f"{dataset}_{method}",
                 "method_arg": method_arg,
-                "config": config_found,
-                "dataset": dataset
+                "config": cfg_path,
+                "dataset": dataset,
+                "method": method
             })
 
 # Check for missing configs
@@ -93,10 +72,11 @@ total_runs = len([r for r in runs if r["config"].exists()]) * N_SEEDS
 print(f"╔═══════════════════════════════════════════════════════╗")
 print(f"║  COMPREHENSIVE CONTINUAL LEARNING BENCHMARK SUITE    ║")
 print(f"╚═══════════════════════════════════════════════════════╝")
-print(f"\nDatasets: {', '.join(BENCHMARKS.keys())}")
+print(f"\nDatasets: {', '.join(DATASETS)}")
 print(f"Methods: {', '.join(METHODS.keys())}")
 print(f"Seeds per run: {N_SEEDS}")
-print(f"Total experiments: {total_runs}\n")
+print(f"Total experiments: {total_runs}")
+print(f"Valid configs found: {len([r for r in runs if r['config'].exists()])}\n")
 
 time.sleep(1)
 
@@ -110,15 +90,16 @@ for r in runs:
     cfg = r["config"]
     method_arg = r["method_arg"]
     dataset = r["dataset"]
+    method = r["method"]
     
     if not cfg.exists():
-        print(f"[SKIP] {label}: config missing {cfg}")
+        print(f"[SKIP] {label}: config missing")
         continue
     
     print(f"\n{'='*70}")
     print(f"RUN: {label}")
     print(f"  Dataset: {dataset}")
-    print(f"  Method: {method_arg}")
+    print(f"  Method: {method}")
     print(f"  Config: {cfg.name}")
     print(f"{'='*70}")
     
@@ -164,6 +145,8 @@ for r in runs:
                 error_info = {
                     "returncode": proc.returncode,
                     "label": label,
+                    "dataset": dataset,
+                    "method": method,
                     "seed": seed,
                     "log_excerpt": log_text[-1000:] if log_text else "No output"
                 }
@@ -182,11 +165,13 @@ for r in runs:
             failed += 1
 
 print(f"\n{'='*70}")
-print(f"SUMMARY")
+print(f"FINAL SUMMARY")
 print(f"{'='*70}")
 print(f"Completed: {completed}")
 print(f"Skipped: {skipped}")
 print(f"Failed: {failed}")
 print(f"Total: {completed + skipped + failed}")
 print(f"\nResults saved to: {OUT_ROOT}")
-print(f"Run: python experiments/build_master_table.py to generate comparison table")
+print(f"\nNext steps:")
+print(f"  1. Run: python experiments/build_master_table.py")
+print(f"  2. Analyze: {OUT_ROOT}/comparison_master_table.csv")

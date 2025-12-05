@@ -34,7 +34,8 @@ METHOD_ARG = {
     "gdumb": "gdumb",
     "mir": "mir",
     "scr": "scr",
-    "vcrr": "vcrr_exp1"
+    "vcrr": "vcrr_exp1",
+    "ucm": "ucm"  # ← ADDED: UCM method
 }
 
 # Run all methods for the specified dataset

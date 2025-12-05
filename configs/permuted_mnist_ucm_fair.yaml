@@ -1,0 +1,22 @@
+dataset:
+  name: permuted_mnist
+  num_tasks: 10
+  classes_per_task: 10
+
+training:
+  model: mlp
+  epochs_per_task: 5
+  batch_size: 128
+  lr: 0.01
+  optimizer: sgd
+  momentum: 0.9
+  weight_decay: 0.0
+  augment: false
+
+method: ucm
+
+ucm:
+  pretrain_foundation: true
+  pretrain_dataset: "task1"
+  pretrain_method: "supervised"
+  pretrain_epochs: 2

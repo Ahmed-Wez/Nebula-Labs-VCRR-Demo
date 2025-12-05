@@ -31,7 +31,8 @@ METHODS = {
     'gdumb': 'gdumb',
     'mir': 'mir',
     'scr': 'scr',
-    'vcrr': 'vcrr_exp1'
+    'vcrr': 'vcrr_exp1',
+    'ucm': 'ucm'
 }
 
 # Build complete run list

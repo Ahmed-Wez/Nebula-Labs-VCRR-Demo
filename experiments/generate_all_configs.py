@@ -7,9 +7,6 @@ CFG_DIR.mkdir(parents=True, exist_ok=True)
 
 print(f"Generating configs in: {CFG_DIR}\n")
 
-# This will create any missing baseline configs
-# Note: We already created these manually, so this is just a backup generator
-
 DATASETS = {
     'cifar10': {
         'num_tasks': 5,
@@ -27,7 +24,9 @@ DATASETS = {
         'epochs': 16,
         'batch_size': 128,
         'buffer_size': 2000,
-        'augment': True
+        'augment': True,
+        'mixup_alpha': 0.1,
+        'scheduler': {'step_size': 4, 'gamma': 0.5}
     },
     'permuted_mnist': {
         'num_tasks': 10,
@@ -84,7 +83,8 @@ METHODS_TEMPLATES = {
         'hybrid': {'use_replay': True, 'exemplar_per_class': 20, 'replay_fraction': 0.2},
         'scr': {'enabled': True, 'selection_mode': 'diversity'}
     },
-    'vcrr': {'vcrr': {'reconfig_k': 32, 'soft_alpha': 0.0, 'apply_to': 'all_linear', 'randomized_svd': False, 'skip_output_linear': True}}
+    'vcrr': {'vcrr': {'reconfig_k': 32, 'soft_alpha': 0.0, 'apply_to': 'all_linear', 'randomized_svd': False, 'skip_output_linear': True}},
+    'ucm': {'ucm': {'pretrain_foundation': True}}
 }
 
 created_count = 0
@@ -95,7 +95,7 @@ for dataset, dset_cfg in DATASETS.items():
         cfg_path = CFG_DIR / cfg_name
         
         if cfg_path.exists():
-            continue  # Don't overwrite existing configs
+            continue
         
         # Build config
         config = {
@@ -116,6 +116,14 @@ for dataset, dset_cfg in DATASETS.items():
             },
             'method': method
         }
+        
+        # Add CIFAR-100 specific settings (mixup and scheduler)
+        # This ensures ALL methods on CIFAR-100 get these settings for fair comparison
+        if dataset == 'cifar100':
+            if 'mixup_alpha' in dset_cfg:
+                config['training']['mixup_alpha'] = dset_cfg['mixup_alpha']
+            if 'scheduler' in dset_cfg:
+                config['training']['scheduler'] = dset_cfg['scheduler']
         
         # Add method-specific config
         for key, value in method_cfg_template.items():

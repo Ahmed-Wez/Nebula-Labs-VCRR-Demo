@@ -947,13 +947,18 @@ class UCMModel(nn.Module):
         return 256  # Default fallback
     
     def extract_features(self, x):
-        """Extract features from foundation network"""
-        if isinstance(self.foundation, (SmallCNN, MLP)):
-            _, features = self.foundation(x, return_features=True)
-        elif isinstance(self.foundation, models.ResNet):
-            _, features = get_features(self.foundation, x)
-        else:
-            features = self.foundation(x)
+        """Extract features from foundation network (always frozen after task 0)"""
+        # Foundation should always be in eval mode when extracting features
+        self.foundation.eval()
+        
+        with torch.no_grad():
+            if isinstance(self.foundation, (SmallCNN, MLP)):
+                _, features = self.foundation(x, return_features=True)
+            elif isinstance(self.foundation, models.ResNet):
+                _, features = get_features(self.foundation, x)
+            else:
+                features = self.foundation(x)
+        
         return features
     
     def add_adapter(self, task_name, adapter):
@@ -963,7 +968,7 @@ class UCMModel(nn.Module):
     
     def forward(self, x, task_name=None):
         """Forward pass through foundation and adapter"""
-        # Extract features
+        # Extract features (always frozen, no gradients)
         z = self.extract_features(x)
         
         # If task specified, use that adapter
@@ -976,7 +981,7 @@ class UCMModel(nn.Module):
             return self.adapters[latest_task](z)
         
         # No adapters yet - error state
-        raise RuntimeError("No adapters available")
+        raise RuntimeError("No adapters available in UCM model")
     
     def forward_all_adapters(self, x):
         """Forward pass through all adapters (for task-agnostic inference)"""
@@ -985,7 +990,6 @@ class UCMModel(nn.Module):
         for task_name in self.task_names:
             outputs[task_name] = self.adapters[task_name](z)
         return outputs
-
 
 def ucm_pillar1_counterfactual_diagnosis(foundation, adapters, data_loader, device, task_name):
     """
@@ -1537,17 +1541,62 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
         # Get UCM config
         ucm_cfg = cfg.get('ucm', {}) or {}
         ucm_pretrain_foundation = bool(ucm_cfg.get('pretrain_foundation', True))
+        ucm_pretrain_dataset = ucm_cfg.get('pretrain_dataset', 'task1').lower()
+        ucm_pretrain_method = ucm_cfg.get('pretrain_method', 'supervised').lower()
+        ucm_pretrain_epochs = int(ucm_cfg.get('pretrain_epochs', 2))
+        
+        # Validate configuration
+        print("\n" + "="*60)
+        print("UCM CONFIGURATION")
+        print("="*60)
+        print(f"Pretrain foundation: {ucm_pretrain_foundation}")
+        print(f"Pretrain dataset: {ucm_pretrain_dataset}")
+        print(f"Pretrain method: {ucm_pretrain_method}")
+        print(f"Pretrain epochs: {ucm_pretrain_epochs}")
+        
+        # Determine if this is Fair or Ideal mode
+        if ucm_pretrain_dataset in ['imagenet', 'external', 'pretrained']:
+            ucm_mode = "IDEAL"
+            print(f"\n🌟 UCM MODE: {ucm_mode} (With External Pretraining)")
+            print("⚠️  NOTE: This gives UCM an advantage over baselines!")
+            print("⚠️  Compare only with other pretrained methods or UCM-Fair.")
+        else:
+            ucm_mode = "FAIR"
+            print(f"\n✓ UCM MODE: {ucm_mode} (Without External Pretraining)")
+            print("✓ Fair comparison with baselines from scratch.")
+        print("="*60 + "\n")
         
         # Create foundation network
-        foundation = get_model(backbone, total_classes, input_channels, input_size).to(device)
+        if ucm_pretrain_dataset in ['imagenet', 'external', 'pretrained']:
+            # UCM-IDEAL: Load pretrained weights
+            print("[UCM-IDEAL] Loading pretrained foundation...")
+            if backbone == 'resnet18':
+                foundation = models.resnet18(pretrained=True)
+                foundation.fc = nn.Linear(foundation.fc.in_features, total_classes)
+            elif backbone == 'resnet34':
+                foundation = models.resnet34(pretrained=True)
+                foundation.fc = nn.Linear(foundation.fc.in_features, total_classes)
+            elif backbone == 'resnet50':
+                foundation = models.resnet50(pretrained=True)
+                foundation.fc = nn.Linear(foundation.fc.in_features, total_classes)
+            else:
+                print(f"⚠️  Warning: No pretrained weights for {backbone}, using random init")
+                foundation = get_model(backbone, total_classes, input_channels, input_size)
+            foundation = foundation.to(device)
+            print(f"✓ Loaded pretrained {backbone} (ImageNet)")
+        else:
+            # UCM-FAIR: Random initialization (will be trained on Task 1)
+            print("[UCM-FAIR] Random initialization (will train on Task 1 data)")
+            foundation = get_model(backbone, total_classes, input_channels, input_size).to(device)
         
-        # Initialize UCM model (don't freeze foundation yet if pretraining)
+        # Initialize UCM model (foundation NOT frozen yet for Fair mode)
         ucm_model = UCMModel(foundation, freeze_foundation=False).to(device)
         
         # Store test loaders for verification
         ucm_test_loaders = []
         
         n_params = count_params(foundation)
+        print(f"Foundation parameters: {n_params:,}")
 
     # Optimizer setup
     weight_decay = float(training_cfg.get('weight_decay', 5e-4))
@@ -1709,6 +1758,38 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             task_name = f"task_{t}"
             ucm_test_loaders.append(test_loader)
             
+            # Special handling for Task 0 in Fair mode
+            if t == 0 and ucm_pretrain_dataset not in ['imagenet', 'external', 'pretrained']:
+                # UCM-FAIR: Pretrain foundation on Task 1 data
+                print(f"\n{'='*60}")
+                print(f"[UCM-FAIR] Task 0: Pretraining foundation on this task's data")
+                print(f"{'='*60}")
+                
+                foundation.train()
+                pretrain_opt = optim.SGD(foundation.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+                
+                for epoch in range(ucm_pretrain_epochs):
+                    train_loss = 0.0
+                    for x, y in train_loader:
+                        x, y = x.to(device), y.to(device)
+                        pretrain_opt.zero_grad()
+                        out = foundation(x)
+                        loss = loss_fn(out, y)
+                        loss.backward()
+                        pretrain_opt.step()
+                        train_loss += loss.item()
+                    print(f"  Pretrain epoch {epoch+1}/{ucm_pretrain_epochs} - Loss: {train_loss/len(train_loader):.4f}")
+                
+                print(f"✓ Foundation pretraining complete")
+                print(f"{'='*60}\n")
+            
+            # Freeze foundation for all tasks (or after Task 0 for Fair mode)
+            if t > 0 or ucm_pretrain_dataset in ['imagenet', 'external', 'pretrained']:
+                for param in ucm_model.foundation.parameters():
+                    param.requires_grad = False
+                ucm_model.foundation.eval()
+                print(f"[UCM] Foundation frozen for task {t}")
+            
             # Pillar 1: Counterfactual Self-Diagnosis
             if t > 0:
                 print(f"  [UCM] Pillar 1: Running counterfactual diagnosis...")
@@ -1724,7 +1805,7 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
                 ucm_model.foundation, train_loader, device, len(cls_list)
             )
             fisher = sizing_info.get('fisher_ratio', 'N/A')
-            print(f"  [UCM] Selected: {adapter_type} (Fisher: {fisher})")
+            print(f"  [UCM] Selected: {adapter_type} adapter (Fisher ratio: {fisher})")
             
             # Pillar 3: Adapter Construction & Connection
             print(f"  [UCM] Pillar 3: Constructing adapter...")
@@ -1733,10 +1814,9 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             )
             ucm_model.add_adapter(task_name, adapter)
             
-            # Setup optimizer for adapter (and foundation on first task)
+            # Setup optimizer for adapter only (foundation frozen after Task 0)
             adapter_params = list(ucm_model.adapters[task_name].parameters())
-            if t == 0 and ucm_pretrain_foundation:
-                adapter_params += list(ucm_model.foundation.parameters())
+            print(f"  [UCM] Training adapter only ({count_params(adapter):,} params)")
             
             if optimizer_name.lower() == 'adamw':
                 opt = optim.AdamW(adapter_params, lr=lr, weight_decay=weight_decay)
@@ -1753,19 +1833,36 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
             
             # Train adapter
             for epoch in range(epochs):
-                ucm_model.train()
                 ucm_model.adapters[task_name].train()
+                ucm_model.foundation.eval()  # Always eval mode for frozen foundation
+                
                 train_loss = 0.0
                 
                 for batch_idx, (x, y) in enumerate(train_loader):
                     x, y = x.to(device), y.to(device)
                     
                     opt.zero_grad()
-                    out = ucm_model(x, task_name=task_name)
+                    
+                    # Extract features with frozen foundation
+                    with torch.no_grad():
+                        if isinstance(ucm_model.foundation, (SmallCNN, MLP)):
+                            _, z = ucm_model.foundation(x, return_features=True)
+                        elif isinstance(ucm_model.foundation, models.ResNet):
+                            _, z = get_features(ucm_model.foundation, x)
+                        else:
+                            z = ucm_model.foundation(x)
+                    
+                    # Forward through adapter
+                    out = ucm_model.adapters[task_name](z)
                     loss = loss_fn(out, y)
                     loss.backward()
-                    opt.step()
                     
+                    # Safety check: ensure no gradients on foundation
+                    for param in ucm_model.foundation.parameters():
+                        if param.grad is not None:
+                            param.grad.zero_()
+                    
+                    opt.step()
                     train_loss += loss.item()
                 
                 if scheduler:
@@ -1773,11 +1870,12 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
                 
                 print(f"  Epoch {epoch+1}/{epochs} - Loss: {train_loss/len(train_loader):.4f}")
             
-            # Freeze foundation after first task
-            if t == 0 and ucm_pretrain_foundation:
-                print(f"  [UCM] Freezing foundation network")
+            # CRITICAL: Ensure foundation stays frozen
+            if t == 0 and ucm_pretrain_dataset not in ['imagenet', 'external', 'pretrained']:
+                print(f"\n[UCM-FAIR] Freezing foundation permanently after Task 0")
                 for param in ucm_model.foundation.parameters():
                     param.requires_grad = False
+                ucm_model.foundation.eval()
             
             # Pillar 4: Verification
             if t > 0:
@@ -1786,7 +1884,7 @@ def run_experiment(cfg, method="ewc", seed=0, out_dir="results/run", total_class
                     ucm_model, ucm_test_loaders, device, t
                 )
                 status = "✓ Passed" if verified else "✗ Failed"
-                print(f"  [UCM] {status}")
+                print(f"  [UCM] Verification: {status}")
                 
         # Train for this task
         if method not in ['ucm']:

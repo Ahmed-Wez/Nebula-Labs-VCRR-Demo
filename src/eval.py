@@ -36,7 +36,7 @@ def load_metrics_from_folder(folder):
         return matrices
     with open(path, 'r') as fh:
         j = json.load(fh)
-        return j.get('acc_matrix', [])
+        return j.get('accuracy_matrix', j.get('acc_matrix', []))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -47,13 +47,15 @@ if __name__ == "__main__":
     rows = []
     for entry in sorted(os.listdir(args.results_dir)):
         p = os.path.join(args.results_dir, entry)
-        if os.path.isdir(p) and ("ewc" in entry or "vcrr" in entry):
+        # Include UCM in evaluation (added "ucm" to the check)
+        if os.path.isdir(p) and any(method in entry for method in ["ewc", "vcrr", "ucm", "er", "agem", "lwf", "baseline", "hope", "packnet", "prognn", "icarl", "gdumb", "mir", "scr", "der"]):
             acc_matrix = load_metrics_from_folder(p)
-            F = forgetting_metric(acc_matrix)
-            rows.append({
-                'run': entry,
-                'F': float(F)
-            })
+            if acc_matrix and len(acc_matrix) > 0:
+                F = forgetting_metric(acc_matrix)
+                rows.append({
+                    'run': entry,
+                    'F': float(F)
+                })
     df = pd.DataFrame(rows)
     df.to_csv(args.out, index=False)
     print("Wrote summary to", args.out)

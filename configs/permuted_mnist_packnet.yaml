@@ -17,4 +17,4 @@ method: packnet
 
 packnet:
   prune_percentage: 0.5
-  retrain_epochs: 3
+  retrain_epochs: 0

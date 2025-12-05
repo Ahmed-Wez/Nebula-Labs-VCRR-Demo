@@ -21,4 +21,4 @@ method: packnet
 
 packnet:
   prune_percentage: 0.5
-  retrain_epochs: 0  # FAIR: No extra training!
+  retrain_epochs: 0
